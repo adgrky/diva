@@ -515,7 +515,16 @@ class _TursoHttpConn:
         if isinstance(v, int):
             return {"type": "integer", "value": str(v)}
         if isinstance(v, float):
+            if not math.isfinite(v):
+                return {"type": "null", "value": None}
             return {"type": "float", "value": v}
+        # numpy の数値（np.int64 など）を文字列として送らない。ローカルの sqlite3 は
+        # 受け付けずに落ちるが、こちらは黙って TEXT で保存し、数値の比較が効かなくなる。
+        if hasattr(v, "item") and not isinstance(v, (str, bytes)):
+            try:
+                return _TursoHttpConn._py_to_arg(v.item())
+            except (TypeError, ValueError):
+                pass
         return {"type": "text", "value": str(v)}
 
     @staticmethod
@@ -585,6 +594,32 @@ class _TursoHttpConn:
                 if "already exists" not in msg.lower():
                     raise Exception(f"Turso executescript error: {msg}")
 
+    def batch(self, stmts: list[tuple[str, tuple]]) -> None:
+        """複数の書き込みを1つのトランザクションで通す。途中で失敗したら全部取り消す。
+
+        execute() は1文ごとに別のHTTPで自動コミットされるので、売却の記録と
+        保有の株数の更新を別々に送ると、間で落ちたとき片方だけが残る。
+        """
+        steps = [{"stmt": {"sql": "BEGIN"}}]
+        for sql, params in stmts:
+            stmt: dict = {"sql": sql}
+            args = [self._py_to_arg(p) for p in params]
+            if args:
+                stmt["args"] = args
+            steps.append({"condition": {"type": "ok", "step": len(steps) - 1}, "stmt": stmt})
+        n = len(steps)
+        steps.append({"condition": {"type": "ok", "step": n - 1}, "stmt": {"sql": "COMMIT"}})
+        steps.append({"condition": {"type": "not", "cond": {"type": "ok", "step": n}},
+                      "stmt": {"sql": "ROLLBACK"}})
+        res = self._http_pipeline([{"type": "batch", "batch": {"steps": steps}},
+                                   {"type": "close"}])[0]
+        if res.get("type") == "error":
+            raise Exception(res.get("error", {}).get("message", "Turso batch error"))
+        errors = res["response"]["result"].get("step_errors", [])
+        for err in errors[:n + 1]:
+            if err:
+                raise Exception(f"Turso batch error: {err.get('message', err)}")
+
     def commit(self):
         pass  # HTTP API は自動コミット
 
@@ -623,6 +658,17 @@ class _DualConn:
     def executemany(self, sql: str, seq_of_params):
         return self._route(sql).executemany(sql, seq_of_params)
 
+    def batch(self, stmts: list[tuple[str, tuple]]) -> None:
+        targets = {id(self._route(sql)) for sql, _ in stmts}
+        if len(targets) > 1:
+            raise ValueError("クラウドとパソコンのテーブルを1つのトランザクションにはできません")
+        target = self._route(stmts[0][0]) if stmts else self._local
+        if target is self._cloud:
+            self._cloud.batch(stmts)
+        else:
+            for sql, params in stmts:
+                self._local.execute(sql, params)
+
     def executescript(self, script: str):
         self._local.executescript(script)
         self._cloud.executescript(_DDL_CLOUD)
@@ -635,6 +681,24 @@ class _DualConn:
 
 
 _bridged = False
+_force_local = False
+
+
+@contextmanager
+def local_only() -> Iterator[None]:
+    """この中の connect() はクラウドに一切つながず、パソコンのDBだけを使う。
+
+    検算のように「DBのコピーで書き込みを試す」処理のためのもの。db_path を
+    差し替えても、TURSO_DATABASE_URL があれば保有・売買はクラウドに振り分けられる。
+    実測: audit.py の書き込み検算が、クラウドの本物の保有を1銘柄ずつ
+    1,000円で売却扱いにして消し、偽の売買記録を残していた。
+    """
+    global _force_local
+    prev, _force_local = _force_local, True
+    try:
+        yield
+    finally:
+        _force_local = prev
 
 
 def _ensure_secrets() -> None:
@@ -665,7 +729,7 @@ def connect(path: Path | None = None) -> Iterator[sqlite3.Connection]:
     try:
         local_conn.execute("PRAGMA journal_mode=WAL")
         local_conn.execute("PRAGMA synchronous=NORMAL")
-        if turso_url and turso_token:
+        if turso_url and turso_token and not _force_local:
             conn = _DualConn(local_conn, _TursoHttpConn(turso_url, turso_token))
         else:
             conn = local_conn
@@ -673,6 +737,19 @@ def connect(path: Path | None = None) -> Iterator[sqlite3.Connection]:
         conn.commit()
     finally:
         local_conn.close()
+
+
+def run_batch(conn, stmts: list[tuple[str, tuple]]) -> None:
+    """複数の書き込みを「全部通るか、全部通らないか」で実行する。
+
+    ローカルの sqlite3 は connect() の with を抜けるまでが1トランザクションなので
+    そのまま流すだけでよい。クラウド行きは1回のHTTPにまとめて送る。
+    """
+    if hasattr(conn, "batch"):
+        conn.batch(stmts)
+    else:
+        for sql, params in stmts:
+            conn.execute(sql, params)
 
 
 # 既存テーブルに後から足した列。CREATE TABLE IF NOT EXISTS は列を追加しないので、
@@ -719,7 +796,7 @@ def upsert_df(table: str, df: pd.DataFrame, columns: Iterable[str],
     # （実測: chunk=300 で 87,017行の書き込みが途中で落ちた。50なら安定）。
     # 呼び出し側は行き先を意識しなくてよい約束なので、ここで自動的に絞る。
     _ensure_secrets()
-    if table in CLOUD_TABLES and os.environ.get("TURSO_DATABASE_URL"):
+    if table in CLOUD_TABLES and os.environ.get("TURSO_DATABASE_URL") and not _force_local:
         chunk = min(chunk, 50)
     sub = df.reindex(columns=columns)
     placeholders = ",".join("?" * len(columns))

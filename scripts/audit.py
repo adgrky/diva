@@ -317,6 +317,9 @@ def audit_writes() -> None:
     orig = C.db_path
     C.db_path = lambda config=None: tmp
     S.db_path = C.db_path
+    # クラウド(Turso)につながったままだと、保有・売買はコピーではなく本物に書かれる。
+    guard = S.local_only()
+    guard.__enter__()
     try:
         S.init_db()
         from modules.config import load_config
@@ -417,6 +420,7 @@ def audit_writes() -> None:
             chk("入金までの日数を変えても配当が二重計上にならない",
                 len(set(counts.values())) == 1, str(counts))
     finally:
+        guard.__exit__(None, None, None)
         C.db_path = orig
         S.db_path = orig
         shutil.rmtree(tmp.parent, ignore_errors=True)

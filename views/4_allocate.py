@@ -23,7 +23,7 @@ from modules import market, review as R, sell_rules as SR
 from modules.allocator import allocate, buy_gate, buy_priority, month_gaps
 from modules.format import to_pct, yen, yen_short
 from modules.portfolio import dividend_calendar, dividend_cash, freed_cash
-from modules.store import connect, read_df
+from modules.store import connect, read_df, run_batch
 from modules.ui import flash, show_flash, get_config, get_positions, get_scores, no_data_guard
 
 st.title("💰 資金投入")
@@ -61,22 +61,23 @@ def _record_sell(account: str, ticker: str, name: str, shares: float,
     税引後の手取りでないと金額が合わないため。
     """
     with connect() as conn:
-        conn.execute(
-            "INSERT INTO transactions (date, account, ticker, name, type, shares, price, "
-            "fee, memo, tax) VALUES (?, ?, ?, ?, 'sell', ?, ?, 0, ?, ?)",
-            (when.isoformat(), account, ticker, name, float(shares), float(price),
-             "整理タブから記録", float(tax)))
         cur = conn.execute("SELECT shares FROM holdings WHERE account=? AND ticker=?",
                            (account, ticker)).fetchone()
         left = (float(cur["shares"]) if cur else 0.0) - float(shares)
+        stmts = [(
+            "INSERT INTO transactions (date, account, ticker, name, type, shares, price, "
+            "fee, memo, tax) VALUES (?, ?, ?, ?, 'sell', ?, ?, 0, ?, ?)",
+            (when.isoformat(), account, ticker, name, float(shares), float(price),
+             "整理タブから記録", float(tax)))]
         if left <= 0.5:
-            conn.execute("DELETE FROM holdings WHERE account=? AND ticker=?", (account, ticker))
-            conn.execute("DELETE FROM holding_review WHERE account=? AND ticker=?",
-                         (account, ticker))
+            stmts += [("DELETE FROM holdings WHERE account=? AND ticker=?", (account, ticker)),
+                      ("DELETE FROM holding_review WHERE account=? AND ticker=?",
+                       (account, ticker))]
         else:
-            conn.execute("UPDATE holdings SET shares=?, updated_at=datetime('now') "
-                         "WHERE account=? AND ticker=?", (left, account, ticker))
-
+            stmts.append(("UPDATE holdings SET shares=?, updated_at=datetime('now') "
+                          "WHERE account=? AND ticker=?", (left, account, ticker)))
+        # 記録と株数の更新は片方だけ残ると二重売却になるので、まとめて通す。
+        run_batch(conn, stmts)
 
 tab_market, tab_buy, tab_sell = st.tabs(["📉 相場と現金", "🛒 買う", "🧹 整理する（売る）"])
 
