@@ -51,8 +51,6 @@ def holidays(year: int) -> frozenset[date]:
         _nth_monday(year, 10, 2),            # スポーツの日
         date(year, 11, 3),                   # 文化の日
         date(year, 11, 23),                  # 勤労感謝の日
-        # 東証だけの休み（大納会の翌日から大発会の前日まで）
-        date(year, 12, 31), date(year, 1, 2), date(year, 1, 3),
     }
     # 振替休日：日曜と重なった祝日は翌平日へ
     for d in sorted(h):
@@ -67,6 +65,10 @@ def holidays(year: int) -> frozenset[date]:
         if (mid not in h and mid.weekday() < 5
                 and mid + timedelta(days=1) in h):
             h.add(mid)
+    # 東証だけの休み（大納会の翌日から大発会の前日まで）。祝日ではないので、
+    # 振替休日・国民の休日の計算より後で足す。先に入れると、元日が日曜の年に
+    # 振替が 1/2・1/3 を飛び越えて大発会の 1/4 を休みにしてしまう（2023年・2034年）。
+    h |= {date(year, 12, 31), date(year, 1, 2), date(year, 1, 3)}
     return frozenset(h)
 
 

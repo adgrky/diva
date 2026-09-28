@@ -243,7 +243,10 @@ def build_profiles(dividends: pd.DataFrame) -> dict[str, DividendProfile]:
 
 def profiles_to_frame(profiles: dict[str, DividendProfile]) -> pd.DataFrame:
     if not profiles:
-        return pd.DataFrame()
+        # 列だけは揃えて返す。空の DataFrame を返すと、配当履歴が1件も無い保有
+        # （無配・新規上場）だけのときに呼び出し側が df["dps_latest"] で落ちる。
+        cols = [k for k in DividendProfile("").to_dict() if k not in ("ticker", "series")]
+        return pd.DataFrame(columns=cols, index=pd.Index([], name="ticker"))
     rows = []
     for p in profiles.values():
         d = p.to_dict()

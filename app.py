@@ -18,6 +18,31 @@ from modules.store import init_db                  # noqa: E402
 
 bridge_secrets_to_env()
 
+
+def _require_password() -> None:
+    """APP_PASSWORD が設定されていれば、合っているまで画面を出さない。
+
+    リポジトリが公開なので、Streamlit Cloud の URL を知っていれば誰でも
+    保有を見られるうえ、保有一覧の保存や売買の記録でクラウドのDBを書き換えられる。
+    secrets.toml（Streamlit Cloud なら Settings → Secrets）に APP_PASSWORD を
+    書いたときだけ効く。書かなければ今までどおり。
+    """
+    import hmac
+    import os
+    want = os.environ.get("APP_PASSWORD")
+    if not want or st.session_state.get("_authed"):
+        return
+    pw = st.text_input("パスワード", type="password")
+    if pw and hmac.compare_digest(pw.encode(), want.encode()):
+        st.session_state["_authed"] = True
+        st.rerun()
+    if pw:
+        st.error("パスワードが違います")
+    st.stop()
+
+
+_require_password()
+
 # テーブルの作成と列の追加（マイグレーション）をここで必ず走らせる。
 # これまでスクリプト側でしか呼んでおらず、列を足したあとアプリだけを起動すると
 # 「no such column」で画面が落ちた（実測: ref_date を足したあとポートフォリオ画面が
