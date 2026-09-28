@@ -281,8 +281,11 @@ def allocate(cash: float, candidates: pd.DataFrame, positions: pd.DataFrame,
                 mine = float(income_now.get(r["ticker"], 0.0)) + amount * y
                 if mine / total_income > cap_income:
                     # 上限に収まる金額まで減らす。単元に満たなければ見送る
-                    room_income = cap_income * total_income - float(
-                        income_now.get(r["ticker"], 0.0))
+                    # 増やす配当 a は (いまの配当 + a) / (ほかの配当 + a) ≤ 上限 を満たす最大値。
+                    # 分母に「削る前の金額」を入れたまま解くと、上限を少し超える。
+                    held = float(income_now.get(r["ticker"], 0.0))
+                    room_income = (cap_income * (income_base + added) - held) / (1 - cap_income) \
+                        if cap_income < 1 else amount * y
                     shares = _lot_size(price, max(0.0, room_income / y), lot)
                     if shares < lot:
                         return False
@@ -333,6 +336,19 @@ def allocate(cash: float, candidates: pd.DataFrame, positions: pd.DataFrame,
                     q["投入額"] for q in picks if q["業種"] == sector)
                 if price > cap_sector * total_after - used:
                     continue
+                # 配当の偏りの上限は積み増しにも当てる。1周目で上限まで削った銘柄に
+                # ここで1株ずつ足すと、上限を素通りしてしまう（1銘柄で配当の16%になった）。
+                y = float(r.get("dividend_yield") or 0.0)
+                if y > 0 and income_base > 0:
+                    total_income = income_base + sum(q["年間配当"] for q in picks) + price * y
+                    mine = float(income_now.get(pk["ticker"], 0.0)) + pk["年間配当"] + price * y
+                    if mine / total_income > cap_income:
+                        continue
+                    if sector in cyc_sectors:
+                        cyc_after = cyc_income_now + sum(
+                            q["年間配当"] for q in picks if q["業種"] in cyc_sectors) + price * y
+                        if cyc_after / total_income > cap_cyc:
+                            continue
                 pk["株数"] += 1
                 pk["投入額"] += price
                 pk["年間配当"] = pk["投入額"] * (r.get("dividend_yield") or 0)
