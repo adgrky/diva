@@ -51,7 +51,8 @@ def legacy_dir(config: dict | None = None) -> Path:
     return raw.resolve() if raw.is_absolute() else (APP_DIR / raw).resolve()
 
 
-_SECRET_KEYS = ("EDINET_API_KEY", "NTFY_TOPIC", "TURSO_DATABASE_URL", "TURSO_AUTH_TOKEN")
+_SECRET_KEYS = ("EDINET_API_KEY", "NTFY_TOPIC", "TURSO_DATABASE_URL", "TURSO_AUTH_TOKEN",
+                "APP_PASSWORD")
 
 
 def bridge_secrets_to_env() -> None:

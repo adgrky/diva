@@ -493,6 +493,9 @@ class _TursoHttpConn:
 
     def __init__(self, url: str, token: str):
         self._base = url.replace("libsql://", "https://")
+        # 鍵は全権（保有の読み書き）なので、暗号化されない http では送らない。
+        if not self._base.startswith("https://"):
+            raise ValueError("TURSO_DATABASE_URL は libsql:// か https:// で書いてください")
         self._token = token
 
     def _http_pipeline(self, requests: list) -> list:

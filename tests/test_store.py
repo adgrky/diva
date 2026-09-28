@@ -145,3 +145,9 @@ def test_batch_refuses_mixing_cloud_and_local(turso):
     with pytest.raises(ValueError):
         with S.connect() as conn:
             S.run_batch(conn, [("DELETE FROM holdings", ()), ("DELETE FROM prices", ())])
+
+
+def test_turso_refuses_plain_http():
+    with pytest.raises(ValueError):
+        S._TursoHttpConn("http://example.com", "t")
+    assert S._TursoHttpConn("libsql://x.turso.io", "t")._base == "https://x.turso.io"
