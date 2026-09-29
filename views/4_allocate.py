@@ -673,16 +673,17 @@ with tab_sell:
     @st.fragment
     def _bulk_list(shown: pd.DataFrame) -> None:
         st.caption("理由の全文は「1銘柄ずつ」で読めます。"
-                   "「今回の判断」を選んでいけば、下のボタンでまとめて記録できます。"
+                   "「判断」の列で選んでいけば、下のボタンでまとめて記録できます。"
                    "売った株数と約定単価は、はじめは全株・直近の株価が入っています。")
         v = pd.DataFrame({
-            "": shown["印"].values,
+            # スマホの幅でも「銘柄名」と「今回の判断」がはみ出さない並び
             "銘柄名": shown["name"].values,
-            "口座": shown["account"].map({"specific": "特定", "nisa": "NISA"}).values,
             "今回の判断": "—",
+            "口座": shown["account"].map({"specific": "特定", "nisa": "NISA"}).values,
             "売った株数": shown["shares"].astype(float).values,
             "約定単価": shown["last_close"].fillna(0).astype(float).values,
             "保有株数": shown["shares"].values,
+            "": shown["印"].values,
             "重さ": shown["重さ"].values,
             "優先度": shown["整理の優先度"].values,
             "コード": shown["code"].values,
@@ -699,8 +700,9 @@ with tab_sell:
         locked = [c for c in v.columns if c not in ("今回の判断", "売った株数", "約定単価")]
         ed = st.data_editor(v, hide_index=True, width="stretch", height=520, key=ed_key,
                             disabled=locked, column_config={
+            "銘柄名": st.column_config.TextColumn(pinned=True),
             "今回の判断": st.column_config.SelectboxColumn(
-                options=["—", "売った", "持ち続ける", "様子見"], required=True, width="medium"),
+                "判断", options=["—", "売った", "持ち続ける", "様子見"], required=True, width="small"),
             "売った株数": st.column_config.NumberColumn(min_value=0.0, step=1.0, format="%.0f"),
             "約定単価": st.column_config.NumberColumn(min_value=0.0, step=0.5, format="¥%.1f"),
             "優先度": st.column_config.ProgressColumn(format="%.0f", min_value=0, max_value=100),
@@ -709,7 +711,7 @@ with tab_sell:
             "損益率": st.column_config.NumberColumn(format="%.1f%%"),
             "配当継続": st.column_config.NumberColumn(format="%.0f"),
             "理由": st.column_config.TextColumn(width="large"),
-            "判断": st.column_config.TextColumn("記録済みの判断"),
+            "判断": st.column_config.TextColumn("記録済み"),
         })
 
         sold = ed[(ed["今回の判断"] == "売った") & (ed["売った株数"] > 0)]
