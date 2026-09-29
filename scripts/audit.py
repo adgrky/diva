@@ -302,6 +302,52 @@ def audit_edges() -> None:
             chk(label, False, f"{type(exc).__name__}: {exc}")
 
 
+def audit_frozen_prices() -> None:
+    """株価が止まった区間（yfinance の埋め草）が週足に残っていないか。
+
+    残っていると、その区間をまたいだ過去検証のリターンが偽物になる
+    （実測: 7564.T の FY2018 で ret_1y +1546%）。直し方は
+    scripts/repair_frozen_prices.py。
+    """
+    from modules.quality import FROZEN_WEEKS, frozen_runs
+    from modules.store import read_df
+
+    section("C2 株価が止まった区間")
+    px = read_df("SELECT ticker, date, close FROM prices")
+    if px.empty:
+        print("  （週足が無いので飛ばします）")
+        return
+    long = frozen_runs(px, FROZEN_WEEKS)
+    chk(f"同じ終値が{FROZEN_WEEKS}週以上続く区間が無い", long.empty,
+        f"{len(long)} 区間 / {long['ticker'].nunique()} 銘柄 → "
+        "scripts/repair_frozen_prices.py で消す" if len(long) else "")
+    for r in long.head(10).itertuples(index=False):
+        print(f"       {r.ticker} {r.close:,.2f} {r.start}〜{r.end}（{r.weeks}週）")
+    # 低位株は呼び値1円で本当に半年動かないことがあるので、ここは NG にせず見せるだけ
+    mid = frozen_runs(px, 26)
+    mid = mid[mid["weeks"] < FROZEN_WEEKS]
+    if len(mid):
+        print(f"  参考 同じ終値が26〜{FROZEN_WEEKS - 1}週続く区間 {len(mid)} か所"
+              "（低位株なら本物のことがある）")
+        for r in mid.head(5).itertuples(index=False):
+            print(f"       {r.ticker} {r.close:,.2f} {r.start}〜{r.end}（{r.weeks}週）")
+
+    # 上場廃止した銘柄は yfinance が新しい株価を返さなくなる。一覧に残っていれば
+    # 週次更新の削除（weekly_scan.purge_delisted）が漏れている。
+    # 保有・ウォッチ中は売却の記録が要るので、わざと残している。
+    section("C3 上場廃止の取り残し")
+    q = read_df("SELECT u.ticker, u.name, q.asof FROM universe u "
+                "LEFT JOIN quotes q ON q.ticker = u.ticker")
+    keep = set(read_df("SELECT ticker FROM holdings UNION SELECT ticker FROM watchlist")
+               ["ticker"])
+    newest = pd.to_datetime(q["asof"]).max()
+    old = q[(pd.to_datetime(q["asof"]) < newest - pd.Timedelta(days=45))
+            & ~q["ticker"].isin(keep)]
+    chk("45日以上株価が更新されない銘柄が一覧に無い", old.empty,
+        f"{len(old)} 銘柄（上場廃止の取り残しの疑い）: "
+        + ", ".join(old["ticker"].head(10)) if len(old) else "")
+
+
 # ──────────────────────────────────────────── D 書き込み（DBのコピーで）
 def audit_writes() -> None:
     from modules.config import db_path
@@ -312,6 +358,7 @@ def audit_writes() -> None:
     tmp = Path(tempfile.mkdtemp()) / "sandbox.db"
     shutil.copy2(real, tmp)
 
+    import sqlite3
     import modules.config as C
     import modules.store as S
     orig = C.db_path
@@ -321,6 +368,12 @@ def audit_writes() -> None:
     guard = S.local_only()
     guard.__enter__()
     try:
+        with S.connect() as probe:
+            if not isinstance(probe, sqlite3.Connection):
+                chk("書き込みの検算がパソコンのコピーだけに向いている", False,
+                    "クラウドに繋がったままなので、書き込みの検算を中止")
+                return
+        chk("書き込みの検算がパソコンのコピーだけに向いている", True)
         S.init_db()
         from modules.config import load_config
         from modules.store import connect, read_df
@@ -415,8 +468,17 @@ def audit_writes() -> None:
                  float(first["shares"]), 1000.0)
             chk("保有が消えたら判断も消える", R.load().empty)
 
-            counts = {lag: len(expected_dividends(load_positions(cfg), cfg, 12, lag))
-                      for lag in (30, 45, 75, 110, 150)}
+            # 比べるのは「どの設定でも入金済みになる古い配当」だけ。最近の権利落ちは
+            # 入金までの日数が短い設定でだけ出てくるのが正しい動きで、件数が違って当然。
+            # 実測（2026-09-29）: 8月末の権利落ち3件が 30日 でだけ出て、誤って NG になった。
+            lags = (30, 45, 75, 110, 150)
+            cutoff = (pd.Timestamp.today().normalize()
+                      - pd.Timedelta(days=max(lags))).date()
+
+            def settled(lag):
+                df = expected_dividends(load_positions(cfg), cfg, 12, lag)
+                return 0 if df.empty else int((df["権利落ち日"] <= cutoff).sum())
+            counts = {lag: settled(lag) for lag in lags}
             chk("入金までの日数を変えても配当が二重計上にならない",
                 len(set(counts.values())) == 1, str(counts))
     finally:
@@ -443,8 +505,8 @@ def audit_code() -> None:
 
     section("E コードの健全性")
     root = Path(__file__).resolve().parent.parent
-    files = (sorted((root / "modules").glob("*.py")) + sorted((root / "views").glob("*.py"))
-             + sorted((root / "scripts").glob("*.py")) + [root / "app.py"])
+    files = (sorted((root / "modules").glob("[!.]*.py")) + sorted((root / "views").glob("[!.]*.py"))
+             + sorted((root / "scripts").glob("[!.]*.py")) + [root / "app.py"])
     src_by_file = {f: f.read_text() for f in files}
     allsrc = "\n".join(src_by_file.values())
 
@@ -469,7 +531,7 @@ def audit_code() -> None:
 
     # E2 画面の入力が使われているか
     dead_widgets = []
-    for f in sorted((root / "views").glob("*.py")):
+    for f in sorted((root / "views").glob("[!.]*.py")):
         src = src_by_file[f]
         for n in ast.walk(ast.parse(src)):
             if isinstance(n, ast.Assign) and isinstance(n.value, ast.Call):
@@ -538,7 +600,7 @@ def audit_code() -> None:
     # dividend_history.annual_dps と定義が食い違っていた。同じ「2019年度の配当」が
     # 画面によって別の数字になる。年度を自前で切っているファイルを見つける。
     fy_dupes = []
-    for f in sorted((root / "modules").glob("*.py")):
+    for f in sorted((root / "modules").glob("[!.]*.py")):
         if f.name in ("dividend_history.py", "hist_panel.py", "jp_calendar.py"):
             continue
         src = src_by_file.get(f, f.read_text())
@@ -601,6 +663,7 @@ def main() -> int:
     audit_numbers()
     audit_contradictions()
     audit_edges()
+    audit_frozen_prices()
     audit_writes()
     audit_code()
     print("\n" + "=" * 62)

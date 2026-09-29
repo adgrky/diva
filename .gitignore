@@ -26,6 +26,10 @@ logs/*.log
 # 検証の中間ファイル
 data/*.csv
 data/.backfill_state
+data/.update.lock
+
+# macOS が外付けドライブへのコピーで作る付属ファイル
+._*
 
 # 手元だけに置くもの（公開しない）
 data/backup/

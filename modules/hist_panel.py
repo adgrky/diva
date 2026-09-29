@@ -36,6 +36,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from modules.quality import price_asof, trim_frame
 from modules.store import read_df
 
 _TODAY = pd.Timestamp.today().normalize()
@@ -362,7 +363,10 @@ def attach_outcomes(panel: pd.DataFrame, horizons=(1, 2, 3, 5)) -> pd.DataFrame:
     """各行に「その後どうなったか」を貼る。判断日は年度末の3ヶ月後。"""
     from modules.dividend_history import build_profile
 
-    px = read_df("SELECT ticker, date, close FROM prices")
+    # 分割が未調整のまま残った区間を落とす（ほかの検証と同じ trim_frame を通す）。
+    # 通していなかったため、8303.T の ret_1y が +183,066%（=1,830倍）になり、
+    # パネル全体の ret_1y 平均が +3,300% に化けていた。
+    px, _ = trim_frame(read_df("SELECT ticker, date, close FROM prices"))
     px["date"] = pd.to_datetime(px["date"])
     px = px[px["close"].notna() & (px["close"] > 0)]
     P = {t: g.set_index("date")["close"].sort_index() for t, g in px.groupby("ticker")}
@@ -408,11 +412,13 @@ def attach_outcomes(panel: pd.DataFrame, horizons=(1, 2, 3, 5)) -> pd.DataFrame:
         if p is None or pd.isna(asof) or p.empty:
             rows.append(rec)
             continue
-        p0 = p[p.index <= asof]
-        if p0.empty:
+        if p.index[0] > asof:
             rows.append(rec)
             continue
-        price0 = float(p0.iloc[-1])
+        # 判断日・満期日の株価は「その日に近い終値」だけを使う。株価の欠けた区間
+        # （売買停止・上場廃止中など）で何年も前の値を拾うと偽のリターンになる。
+        # 株価が無くても配当の実績は正しいので、配当側の答えは付ける。
+        price0 = price_asof(p, asof)
         rec["price0"] = price0
         d0 = float(d[(d.index > asof - pd.DateOffset(years=1)) & (d.index <= asof)].sum()) \
             if d is not None else 0.0
@@ -422,11 +428,10 @@ def attach_outcomes(panel: pd.DataFrame, horizons=(1, 2, 3, 5)) -> pd.DataFrame:
             end = asof + pd.DateOffset(years=h)
             if pd.isna(last_px) or end > last_px - pd.Timedelta(days=30):
                 continue
-            p1 = p[p.index <= end]
-            if p1.empty:
-                continue
             recv = float(d[(d.index > asof) & (d.index <= end)].sum()) if d is not None else 0.0
-            rec[f"ret_{h}y"] = (float(p1.iloc[-1]) + recv) / price0 - 1
+            price1 = price_asof(p, end)
+            if price0 > 0 and price1 > 0:
+                rec[f"ret_{h}y"] = (price1 + recv) / price0 - 1
             if d0 > 0 and d is not None:
                 d1 = float(d[(d.index > end - pd.DateOffset(years=1)) & (d.index <= end)].sum())
                 rec[f"dps_growth_{h}y"] = d1 / d0 - 1

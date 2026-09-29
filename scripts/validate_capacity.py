@@ -38,7 +38,7 @@ from scipy.stats import spearmanr                     # noqa: E402
 
 from modules.dividend_history import build_profile    # noqa: E402
 from modules.store import read_df                     # noqa: E402
-from modules.quality import trim_frame                # noqa: E402
+from modules.quality import price_asof, trim_frame    # noqa: E402
 
 FACTORS = {
     "A_配当性向の低さ": "payout_neg",
@@ -84,12 +84,11 @@ def build_cohort(fy: int, horizon: int, prices: pd.DataFrame,
         px, dv = px_all.get(r.ticker), dv_all.get(r.ticker)
         if px is None or dv is None or px.empty or dv.empty:
             continue
-        p0 = px[px.index <= asof]
-        p1 = px[px.index <= end]
-        if p0.empty or p1.empty or px.index.max() < end - pd.Timedelta(days=45):
+        if px.index.max() < end - pd.Timedelta(days=45):
             continue
-        price0, price1 = float(p0.iloc[-1]), float(p1.iloc[-1])
-        if price0 <= 0:
+        # 欠けた区間の古い値を拾わない（quality.price_asof 参照）
+        price0, price1 = price_asof(px, asof), price_asof(px, end)
+        if not (price0 > 0 and price1 > 0):
             continue
         d0 = float(dv[(dv.index > asof - pd.DateOffset(years=1)) & (dv.index <= asof)].sum())
         if d0 <= 0:

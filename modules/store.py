@@ -827,6 +827,29 @@ def upsert_df(table: str, df: pd.DataFrame, columns: Iterable[str],
     return len(rows)
 
 
+# 上場廃止した銘柄を消すときに対象にするテーブル。相場・財務のデータだけ。
+# 保有・売買・判断・ウォッチ・通知はケンの記録なので、ここには入れない。
+MARKET_TABLES = ("universe", "prices", "dividends", "splits", "quotes", "scores",
+                 "snapshots", "fundamentals", "edinet_summary", "company_profile")
+
+
+def purge_tickers(tickers: Iterable[str], path: Path | None = None) -> dict[str, int]:
+    """銘柄の相場・財務データをすべてのテーブルから消す。返り値はテーブルごとの行数。"""
+    tickers = sorted(set(tickers))
+    if not tickers:
+        return {}
+    marks = ",".join("?" * len(tickers))
+    out = {}
+    with connect(path) as conn:
+        for t in MARKET_TABLES:
+            n = conn.execute(f"SELECT COUNT(*) FROM {t} WHERE ticker IN ({marks})",
+                             tickers).fetchone()[0]
+            if n:
+                conn.execute(f"DELETE FROM {t} WHERE ticker IN ({marks})", tickers)
+                out[t] = int(n)
+    return out
+
+
 def read_df(sql: str, params: tuple = (), path: Path | None = None) -> pd.DataFrame:
     with connect(path) as conn:
         cur = conn.execute(sql, params)

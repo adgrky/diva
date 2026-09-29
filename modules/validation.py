@@ -31,7 +31,7 @@ import numpy as np
 import pandas as pd
 
 from modules.dividend_history import build_profile
-from modules.quality import trim_frame, winsorize
+from modules.quality import price_asof, trim_frame, winsorize
 
 # 検証できる指標だけを列挙する。名前は「どの層に属するか」を接頭辞で示す。
 TESTABLE_FACTORS = {
@@ -77,8 +77,8 @@ def build_asof_features(ticker: str, bars: pd.DataFrame, div: pd.DataFrame,
     if prof.years_paying < 5 or prof.dps_latest <= 0:
         return None
 
-    price_now = float(px.iloc[-1])
-    if price_now <= 0:
+    price_now = price_asof(px, asof)   # 欠けた区間の古い値は使わない（quality 参照）
+    if not price_now > 0:
         return None
 
     # 自己ヒストリカル利回りパーセンタイル（asof 時点までの分布で）
@@ -121,8 +121,11 @@ def build_outcomes(ticker: str, bars: pd.DataFrame, div: pd.DataFrame,
     if px_fwd.empty or prices.index.max() < end - pd.Timedelta(days=45):
         return None  # 期間が満了していない銘柄は検証に入れない（上場廃止も含む）
 
+    price_end = price_asof(px_fwd, end)
+    if not price_end > 0:
+        return None  # 満期日の近くに株価が無い（売買停止・欠けた区間）
+
     dv_fwd = div[(div["date"] > asof) & (div["date"] <= end)]
-    price_end = float(px_fwd.iloc[-1])
     divs_received = float(dv_fwd["amount"].sum())
 
     prof_end = build_profile(ticker, div[div["date"] <= end])

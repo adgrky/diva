@@ -33,8 +33,8 @@ from modules.config import load_config                                # noqa: E4
 from modules.fundamentals import RateLimited                          # noqa: E402
 from modules.dividend_history import build_profiles, profiles_to_frame  # noqa: E402
 from modules.pipeline import fetch_fundamentals, load_base, prescreen, run_scoring  # noqa: E402
-from modules.store import connect, init_db, read_df, upsert_df        # noqa: E402
-from modules.universe import fetch_universe                           # noqa: E402
+from modules.store import connect, init_db, purge_tickers, read_df, upsert_df  # noqa: E402
+from modules.universe import delisted_to_purge, fetch_delisted, fetch_universe  # noqa: E402
 
 _UNIVERSE_COLS = ["ticker", "code", "name", "sector33", "market", "scale", "updated_at"]
 _QUOTE_COLS = ["ticker", "asof", "last_close", "high_52w", "low_52w", "pos_52w",
@@ -48,10 +48,42 @@ def _log(msg: str) -> None:
 def refresh_universe(config: dict) -> pd.DataFrame:
     _log("Stage 0: JPX から上場銘柄一覧を取得中...")
     uni = fetch_universe(config["universe"]["markets"])
+    uni = purge_delisted(uni)
     uni["updated_at"] = datetime.now().strftime("%Y-%m-%d")
     upsert_df("universe", uni, _UNIVERSE_COLS)
     _log(f"Stage 0: {len(uni)} 銘柄 / {uni['sector33'].nunique()} 業種")
     return uni
+
+
+def purge_delisted(uni: pd.DataFrame) -> pd.DataFrame:
+    """上場廃止した銘柄を一覧から外し、相場・財務のデータを消す。
+
+    JPX の一覧は前月末時点なので、それだけでは月の途中の廃止を拾えない。
+    廃止ページと突き合わせる（modules/universe.py の fetch_delisted）。
+    保有・ウォッチ中の銘柄は消さずに知らせるだけ（売却の記録が要るため）。
+    """
+    known = set(read_df("SELECT ticker FROM universe")["ticker"])
+    listed = set(uni["ticker"])
+    # 一覧の取得が中途半端だと、上場中の銘柄まで「一覧から消えた」扱いになる
+    if known and len(listed) < 0.9 * len(known):
+        _log(f"  ⚠️ JPX 一覧が {len(listed)} 銘柄しかない（前回 {len(known)}）。上場廃止の削除は見送り")
+        return uni
+    try:
+        delisted = fetch_delisted()
+    except Exception as exc:
+        _log(f"  ⚠️ 上場廃止ページが読めない（{exc}）。一覧から消えた銘柄だけ処理")
+        delisted = None
+    protected = set(read_df("SELECT ticker FROM holdings UNION SELECT ticker FROM watchlist")
+                    ["ticker"])
+    purge, kept = delisted_to_purge(listed, known, delisted,
+                                    protected, pd.Timestamp(datetime.now().date()))
+    if purge:
+        counts = purge_tickers(purge)
+        _log(f"  上場廃止 {len(purge)} 銘柄のデータを消した: {', '.join(sorted(purge))} "
+             f"（{sum(counts.values()):,} 行）")
+    for t in sorted(kept):
+        _log(f"  ⚠️ {t} は上場廃止したが保有・ウォッチ中なので残した。売却を記録してください")
+    return uni[~uni["ticker"].isin(purge)].reset_index(drop=True)
 
 
 def refresh_prices(tickers: list[str], config: dict) -> dict:

@@ -27,7 +27,8 @@ from typing import Callable, Iterable
 import pandas as pd
 import yfinance as yf
 
-from modules.quality import last_bad_jump, split_is_sane
+from modules.quality import (FROZEN_WEEKS, filler_bars, frozen_mask, last_bad_jump,
+                             split_is_sane)
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -73,11 +74,21 @@ def _clean(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _weekly(df: pd.DataFrame) -> pd.DataFrame:
-    """週足に落とす。全市場の日足を持つと2,000万行を超えるため。"""
+    """週足に落とす。全市場の日足を持つと2,000万行を超えるため。
+
+    売買の無かった日の埋め草（出来高0・四本値が直前の終値）は終値として使わない。
+    1週間まるごと埋め草なら、その週は行ごと無し（=欠損）にする。
+    日足そのものからは消さない。配当・分割がその日に付いていることがあるため。
+    """
+    close = df["Close"].mask(filler_bars(df))
     w = pd.DataFrame({
-        "close": df["Close"].resample("W-FRI").last(),
+        "close": close.resample("W-FRI").last(),
         "volume": df["Volume"].resample("W-FRI").sum(),
     }).dropna(subset=["close"])
+    if len(w) >= FROZEN_WEEKS:
+        frozen = frozen_mask(pd.DataFrame({"ticker": "_", "date": w.index,
+                                           "close": w["close"].values}))
+        w = w[~frozen.to_numpy()]
     return w
 
 

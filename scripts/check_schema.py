@@ -66,9 +66,9 @@ def main() -> int:
     init_db()                       # 先にマイグレーションを済ませてから照合する
     conn = sqlite3.connect(f"file:{db_path()}?mode=ro", uri=True)
 
-    files = sorted(list((ROOT / "modules").glob("*.py"))
-                   + list((ROOT / "views").glob("*.py"))
-                   + list((ROOT / "scripts").glob("*.py")) + [ROOT / "app.py"])
+    files = sorted(list((ROOT / "modules").glob("[!.]*.py"))
+                   + list((ROOT / "views").glob("[!.]*.py"))
+                   + list((ROOT / "scripts").glob("[!.]*.py")) + [ROOT / "app.py"])
     n_sql = 0
     bad: list[tuple[str, int, str, str]] = []
     for f in files:
