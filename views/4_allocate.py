@@ -60,24 +60,45 @@ def _record_sell(account: str, ticker: str, name: str, shares: float,
     税額も一緒に残す。「整理して生まれたお金をそのまま次の買い付けに回す」ときに、
     税引後の手取りでないと金額が合わないため。
     """
+    _record_sells([dict(account=account, ticker=ticker, name=name, shares=shares,
+                        price=price, when=when, tax=tax)])
+
+
+def _record_sells(items: list[dict]) -> None:
+    """複数の売却を1回で記録する。一覧からまとめて売ったとき用。
+
+    クラウドDBだと1件ごとに往復が発生するので、保有株数の読み出しも書き込みも1回にまとめる。
+    """
     with connect() as conn:
-        cur = conn.execute("SELECT shares FROM holdings WHERE account=? AND ticker=?",
-                           (account, ticker)).fetchone()
-        left = (float(cur["shares"]) if cur else 0.0) - float(shares)
-        stmts = [(
-            "INSERT INTO transactions (date, account, ticker, name, type, shares, price, "
-            "fee, memo, tax) VALUES (?, ?, ?, ?, 'sell', ?, ?, 0, ?, ?)",
-            (when.isoformat(), account, ticker, name, float(shares), float(price),
-             "整理タブから記録", float(tax)))]
-        if left <= 0.5:
-            stmts += [("DELETE FROM holdings WHERE account=? AND ticker=?", (account, ticker)),
-                      ("DELETE FROM holding_review WHERE account=? AND ticker=?",
-                       (account, ticker))]
-        else:
-            stmts.append(("UPDATE holdings SET shares=?, updated_at=datetime('now') "
-                          "WHERE account=? AND ticker=?", (left, account, ticker)))
+        held = {(r["account"], r["ticker"]): float(r["shares"]) for r in
+                conn.execute("SELECT account, ticker, shares FROM holdings").fetchall()}
+        stmts = []
+        for it in items:
+            key = (it["account"], it["ticker"])
+            left = held.get(key, 0.0) - float(it["shares"])
+            held[key] = left
+            stmts.append((
+                "INSERT INTO transactions (date, account, ticker, name, type, shares, price, "
+                "fee, memo, tax) VALUES (?, ?, ?, ?, 'sell', ?, ?, 0, ?, ?)",
+                (it["when"].isoformat(), it["account"], it["ticker"], it["name"],
+                 float(it["shares"]), float(it["price"]), "整理タブから記録",
+                 float(it.get("tax", 0.0)))))
+            if left <= 0.5:
+                stmts += [("DELETE FROM holdings WHERE account=? AND ticker=?", key),
+                          ("DELETE FROM holding_review WHERE account=? AND ticker=?", key)]
+            else:
+                stmts.append(("UPDATE holdings SET shares=?, updated_at=datetime('now') "
+                              "WHERE account=? AND ticker=?", (left, *key)))
         # 記録と株数の更新は片方だけ残ると二重売却になるので、まとめて通す。
         run_batch(conn, stmts)
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _evaluate(pos: pd.DataFrame, _config: dict) -> pd.DataFrame:
+    """整理候補の判定。画面を触るたびに数秒かかっていたので覚えておく。
+    記録したときは st.cache_data.clear() で消えるので、判断の反映は遅れない。"""
+    ev = SR.evaluate(pos, _config)
+    return R.attach(ev) if not ev.empty else ev
+
 
 tab_market, tab_buy, tab_sell = st.tabs(["📉 相場と現金", "🛒 買う", "🧹 整理する（売る）"])
 
@@ -484,8 +505,7 @@ with tab_buy:
 
 # ═══════════════════════════════════════════════ 整理する
 with tab_sell:
-    ev = SR.evaluate(positions, config)
-    ev = R.attach(ev) if not ev.empty else ev
+    ev = _evaluate(positions, config)
     counts = SR.summary(ev)
 
     st.markdown("#### いま何が起きているか")
@@ -649,31 +669,94 @@ with tab_sell:
                 st.rerun()
 
     # ────────────────────────────── 一覧
-    else:
-        st.caption("理由の全文は「1銘柄ずつ」で読めます。ここは見渡すためのものです。")
+    # 表を触るたびにページ全体を計算し直すと遅いので、この表だけ動かす
+    @st.fragment
+    def _bulk_list(shown: pd.DataFrame) -> None:
+        st.caption("理由の全文は「1銘柄ずつ」で読めます。"
+                   "「今回の判断」を選んでいけば、下のボタンでまとめて記録できます。"
+                   "売った株数と約定単価は、はじめは全株・直近の株価が入っています。")
         v = pd.DataFrame({
             "": shown["印"].values,
+            "銘柄名": shown["name"].values,
+            "口座": shown["account"].map({"specific": "特定", "nisa": "NISA"}).values,
+            "今回の判断": "—",
+            "売った株数": shown["shares"].astype(float).values,
+            "約定単価": shown["last_close"].fillna(0).astype(float).values,
+            "保有株数": shown["shares"].values,
             "重さ": shown["重さ"].values,
             "優先度": shown["整理の優先度"].values,
             "コード": shown["code"].values,
-            "銘柄名": shown["name"].values,
             "業種": shown["sector33"].values,
-            "口座": shown["account"].map({"specific": "特定", "nisa": "NISA"}).values,
             "評価額": shown["eval_value"].values,
             "損益率": to_pct(shown["pnl_pct"]).values,
             "配当継続": shown["health"].round(0).values,
             "理由": shown["理由"].str.replace("\n- ", " ／ ").str.lstrip("- ").values,
             "判断": shown["判断"].values,
         })
-        st.dataframe(v, hide_index=True, width="stretch", height=520, column_config={
+        # 行の並びが変わると、前の編集が別の銘柄に当たってしまう。
+        # 表示中の銘柄の組み合わせごとに別の表として扱う。
+        ed_key = "bulk_sell_" + str(abs(hash(tuple(shown["account"] + shown["ticker"]))))
+        locked = [c for c in v.columns if c not in ("今回の判断", "売った株数", "約定単価")]
+        ed = st.data_editor(v, hide_index=True, width="stretch", height=520, key=ed_key,
+                            disabled=locked, column_config={
+            "今回の判断": st.column_config.SelectboxColumn(
+                options=["—", "売った", "持ち続ける", "様子見"], required=True, width="medium"),
+            "売った株数": st.column_config.NumberColumn(min_value=0.0, step=1.0, format="%.0f"),
+            "約定単価": st.column_config.NumberColumn(min_value=0.0, step=0.5, format="¥%.1f"),
             "優先度": st.column_config.ProgressColumn(format="%.0f", min_value=0, max_value=100),
+            "保有株数": st.column_config.NumberColumn(format="%.0f"),
             "評価額": st.column_config.NumberColumn(format="¥%d"),
             "損益率": st.column_config.NumberColumn(format="%.1f%%"),
             "配当継続": st.column_config.NumberColumn(format="%.0f"),
             "理由": st.column_config.TextColumn(width="large"),
+            "判断": st.column_config.TextColumn("記録済みの判断"),
         })
+
+        sold = ed[(ed["今回の判断"] == "売った") & (ed["売った株数"] > 0)]
+        kept = ed[ed["今回の判断"].isin(["持ち続ける", "様子見"])]
+        over = sold[sold["売った株数"] > sold["保有株数"] + 1e-9]
+        if not sold.empty:
+            sd = st.date_input("約定日（まとめて記録する売却すべてに使います）",
+                               value=date.today(), key="bulk_sell_date")
+            taxes = [_tax(shown.iloc[i], r["売った株数"], r["約定単価"])
+                     for i, r in sold.iterrows()]
+            gross = float((sold["売った株数"] * sold["約定単価"]).sum())
+            lost = float(sum(r["売った株数"] * (shown.iloc[i].get("dps_latest") or 0)
+                             for i, r in sold.iterrows()))
+            e1, e2, e3, e4 = st.columns(4)
+            e1.metric("売却代金", yen(gross))
+            e2.metric("売却益の税金", yen(sum(taxes)),
+                      help="特定口座 20.315%。含み損なら0円。NISAは非課税")
+            e3.metric("手取り", yen(gross - sum(taxes)))
+            e4.metric("なくなる年間配当", yen(lost))
+        if not over.empty:
+            st.error("保有株数より多く売ったことになっている行があります: "
+                     + "、".join(over["銘柄名"].astype(str)))
+
+        n = len(sold) + len(kept)
+        if st.button(f"この {n} 件をまとめて記録する", type="primary",
+                     disabled=n == 0 or not over.empty, key="bulk_sell_go"):
+            if not sold.empty:
+                _record_sells([dict(
+                    account=shown.iloc[i]["account"], ticker=shown.iloc[i]["ticker"],
+                    name=shown.iloc[i]["name"], shares=r["売った株数"], price=r["約定単価"],
+                    when=sd, tax=_tax(shown.iloc[i], r["売った株数"], r["約定単価"]))
+                    for i, r in sold.iterrows()])
+            for i, r in kept.iterrows():
+                R.save(shown.iloc[i]["account"], shown.iloc[i]["ticker"],
+                       "keep" if r["今回の判断"] == "持ち続ける" else "watch")
+            st.session_state.pop(ed_key, None)
+            flash(f"✅ 売却 {len(sold)} 件（{yen(gross) if not sold.empty else '¥0'}）"
+                  f"・持ち続ける／様子見 {len(kept)} 件を記録しました。"
+                  "ポートフォリオの株数に反映されています。")
+            st.cache_data.clear()
+            st.rerun(scope="app")
+
         st.download_button("この一覧をCSVで保存", v.to_csv(index=False).encode("utf-8-sig"),
                            f"整理候補_{date.today():%Y%m%d}.csv", "text/csv")
+
+    if not shown.empty and view_mode == "一覧":
+        _bulk_list(shown)
 
     st.divider()
     with st.expander("記録した判断を取り消す"):
@@ -704,7 +787,14 @@ with tab_sell:
         else:
             tx["account"] = tx["account"].map({"specific": "特定", "nisa": "NISA"}).fillna(tx["account"])
             tx["type"] = tx["type"].map({"buy": "買い", "sell": "売り", "dividend": "配当"}).fillna(tx["type"])
-            tx["金額"] = (tx["shares"] * tx["price"]).round(0)
+            # 配当は「株数1 × 単価＝受取額」で保存している。表示では実際の株数に戻す
+            is_div = tx["type"] == "配当"
+            amt = tx["shares"] * tx["price"]
+            div_sh = tx["memo"].str.extract(r"／([\d,.]+)株")[0].str.replace(",", "")
+            div_sh = pd.to_numeric(div_sh, errors="coerce")
+            tx.loc[is_div, "shares"] = div_sh[is_div]
+            tx.loc[is_div, "price"] = (amt / div_sh)[is_div]
+            tx["金額"] = amt.round(0)
             st.dataframe(tx.rename(columns={
                 "date": "日付", "account": "口座", "ticker": "銘柄", "name": "銘柄名",
                 "type": "種別", "shares": "株数", "price": "単価", "memo": "メモ"}),
