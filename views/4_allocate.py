@@ -672,13 +672,13 @@ with tab_sell:
     # 表を触るたびにページ全体を計算し直すと遅いので、この表だけ動かす
     @st.fragment
     def _bulk_list(shown: pd.DataFrame) -> None:
-        st.caption("理由の全文は「1銘柄ずつ」で読めます。"
-                   "「判断」の列で選んでいけば、下のボタンでまとめて記録できます。"
-                   "売った株数と約定単価は、はじめは全株・直近の株価が入っています。")
+        st.caption("左のチェックを押して銘柄を選び、下のボタンでまとめて記録します。"
+                   "売った株数と約定単価は、はじめは全株・直近の株価が入っています"
+                   "（変えるときはマスをダブルクリック）。理由の全文は「1銘柄ずつ」で読めます。")
         v = pd.DataFrame({
-            # スマホの幅でも「銘柄名」と「今回の判断」がはみ出さない並び
+            # スマホの幅でもチェックと銘柄名がはみ出さない並び
+            "選ぶ": False,
             "銘柄名": shown["name"].values,
-            "今回の判断": "—",
             "口座": shown["account"].map({"specific": "特定", "nisa": "NISA"}).values,
             "売った株数": shown["shares"].astype(float).values,
             "約定単価": shown["last_close"].fillna(0).astype(float).values,
@@ -697,12 +697,12 @@ with tab_sell:
         # 行の並びが変わると、前の編集が別の銘柄に当たってしまう。
         # 表示中の銘柄の組み合わせごとに別の表として扱う。
         ed_key = "bulk_sell_" + str(abs(hash(tuple(shown["account"] + shown["ticker"]))))
-        locked = [c for c in v.columns if c not in ("今回の判断", "売った株数", "約定単価")]
+        locked = [c for c in v.columns if c not in ("選ぶ", "売った株数", "約定単価")]
         ed = st.data_editor(v, hide_index=True, width="stretch", height=520, key=ed_key,
                             disabled=locked, column_config={
+            # チェックは1回のクリックで切り替わる（選択肢のマスはダブルクリックが要って使いにくかった）
+            "選ぶ": st.column_config.CheckboxColumn("✓", pinned=True, width="small"),
             "銘柄名": st.column_config.TextColumn(pinned=True),
-            "今回の判断": st.column_config.SelectboxColumn(
-                "判断", options=["—", "売った", "持ち続ける", "様子見"], required=True, width="small"),
             "売った株数": st.column_config.NumberColumn(min_value=0.0, step=1.0, format="%.0f"),
             "約定単価": st.column_config.NumberColumn(min_value=0.0, step=0.5, format="¥%.1f"),
             "優先度": st.column_config.ProgressColumn(format="%.0f", min_value=0, max_value=100),
@@ -714,48 +714,62 @@ with tab_sell:
             "判断": st.column_config.TextColumn("記録済み"),
         })
 
-        sold = ed[(ed["今回の判断"] == "売った") & (ed["売った株数"] > 0)]
-        kept = ed[ed["今回の判断"].isin(["持ち続ける", "様子見"])]
+        st.download_button("この一覧をCSVで保存", v.to_csv(index=False).encode("utf-8-sig"),
+                           f"整理候補_{date.today():%Y%m%d}.csv", "text/csv",
+                           key="bulk_csv")
+
+        picked = ed[ed["選ぶ"]]
+        if picked.empty:
+            st.info("まだ選ばれていません。表の左端のチェックを押してください。")
+            return
+
+        sold = picked[picked["売った株数"] > 0]
         over = sold[sold["売った株数"] > sold["保有株数"] + 1e-9]
-        if not sold.empty:
-            sd = st.date_input("約定日（まとめて記録する売却すべてに使います）",
-                               value=date.today(), key="bulk_sell_date")
-            taxes = [_tax(shown.iloc[i], r["売った株数"], r["約定単価"])
-                     for i, r in sold.iterrows()]
-            gross = float((sold["売った株数"] * sold["約定単価"]).sum())
-            lost = float(sum(r["売った株数"] * (shown.iloc[i].get("dps_latest") or 0)
-                             for i, r in sold.iterrows()))
-            e1, e2, e3, e4 = st.columns(4)
-            e1.metric("売却代金", yen(gross))
-            e2.metric("売却益の税金", yen(sum(taxes)),
-                      help="特定口座 20.315%。含み損なら0円。NISAは非課税")
-            e3.metric("手取り", yen(gross - sum(taxes)))
-            e4.metric("なくなる年間配当", yen(lost))
+        st.markdown(f"**{len(picked)} 件選んでいます**：" + "、".join(picked["銘柄名"].astype(str)))
+        sd = st.date_input("約定日（売ったとして記録するときに使います）",
+                           value=date.today(), key="bulk_sell_date")
+        taxes = [_tax(shown.iloc[i], r["売った株数"], r["約定単価"]) for i, r in sold.iterrows()]
+        gross = float((sold["売った株数"] * sold["約定単価"]).sum())
+        lost = float(sum(r["売った株数"] * (shown.iloc[i].get("dps_latest") or 0)
+                         for i, r in sold.iterrows()))
+        e1, e2, e3, e4 = st.columns(4)
+        e1.metric("売却代金", yen(gross))
+        e2.metric("売却益の税金", yen(sum(taxes)),
+                  help="特定口座 20.315%。含み損なら0円。NISAは非課税")
+        e3.metric("手取り", yen(gross - sum(taxes)))
+        e4.metric("なくなる年間配当", yen(lost))
         if not over.empty:
             st.error("保有株数より多く売ったことになっている行があります: "
                      + "、".join(over["銘柄名"].astype(str)))
 
-        n = len(sold) + len(kept)
-        if st.button(f"この {n} 件をまとめて記録する", type="primary",
-                     disabled=n == 0 or not over.empty, key="bulk_sell_go"):
-            if not sold.empty:
-                _record_sells([dict(
-                    account=shown.iloc[i]["account"], ticker=shown.iloc[i]["ticker"],
-                    name=shown.iloc[i]["name"], shares=r["売った株数"], price=r["約定単価"],
-                    when=sd, tax=_tax(shown.iloc[i], r["売った株数"], r["約定単価"]))
-                    for i, r in sold.iterrows()])
-            for i, r in kept.iterrows():
+        b1, b2, b3 = st.columns(3)
+        go_sell = b1.button(f"🧹 売った（{len(sold)} 件）", type="primary",
+                            disabled=sold.empty or not over.empty, key="bulk_sell_go",
+                            width="stretch")
+        go_keep = b2.button(f"持ち続ける（{len(picked)} 件）", key="bulk_keep_go",
+                            width="stretch")
+        go_watch = b3.button(f"様子見（{len(picked)} 件）", key="bulk_watch_go",
+                             width="stretch")
+        if go_sell:
+            _record_sells([dict(
+                account=shown.iloc[i]["account"], ticker=shown.iloc[i]["ticker"],
+                name=shown.iloc[i]["name"], shares=r["売った株数"], price=r["約定単価"],
+                when=sd, tax=_tax(shown.iloc[i], r["売った株数"], r["約定単価"]))
+                for i, r in sold.iterrows()])
+            msg = (f"✅ {len(sold)} 件・{yen(gross)} を売却として記録しました。"
+                   "ポートフォリオの株数に反映されています。")
+        elif go_keep or go_watch:
+            for i in picked.index:
                 R.save(shown.iloc[i]["account"], shown.iloc[i]["ticker"],
-                       "keep" if r["今回の判断"] == "持ち続ける" else "watch")
+                       "keep" if go_keep else "watch")
+            msg = (f"✅ {len(picked)} 件を「{'持ち続ける' if go_keep else '様子見'}」"
+                   "として記録しました。次から隠れます。")
+        if go_sell or go_keep or go_watch:
             st.session_state.pop(ed_key, None)
-            flash(f"✅ 売却 {len(sold)} 件（{yen(gross) if not sold.empty else '¥0'}）"
-                  f"・持ち続ける／様子見 {len(kept)} 件を記録しました。"
-                  "ポートフォリオの株数に反映されています。")
+            flash(msg)
             st.cache_data.clear()
             st.rerun(scope="app")
 
-        st.download_button("この一覧をCSVで保存", v.to_csv(index=False).encode("utf-8-sig"),
-                           f"整理候補_{date.today():%Y%m%d}.csv", "text/csv")
 
     if not shown.empty and view_mode == "一覧":
         _bulk_list(shown)
