@@ -26,3 +26,7 @@ logs/*.log
 # 検証の中間ファイル
 data/*.csv
 data/.backfill_state
+
+# 手元だけに置くもの（公開しない）
+data/backup/
+research/
