@@ -67,7 +67,12 @@ def status(tail: int = 6) -> dict:
         return out
     lines = [ln.rstrip() for ln in LOG.read_text(encoding="utf-8", errors="ignore")
              .splitlines() if ln.strip()]
-    out["started"] = datetime.fromtimestamp(LOG.stat().st_ctime)
+    # 開始時刻は1行目の [YYYY-mm-dd HH:MM:SS] から取る。ファイルの日時は
+    # 書き込むたびに動くので使えない（実測: 終わった時刻が開始として出た）
+    try:
+        out["started"] = datetime.strptime(lines[0][1:20], "%Y-%m-%d %H:%M:%S")
+    except (IndexError, ValueError):
+        out["started"] = datetime.fromtimestamp(LOG.stat().st_mtime)
     # 銘柄ごとの細かい進捗は読みにくいので、段階の見出しと％だけ残す
     keep = [ln for ln in lines if ("▶" in ln or "✅" in ln or "⚠" in ln or "Stage" in ln
                                    or "%" in ln or "完了" in ln or "失敗" in ln)]

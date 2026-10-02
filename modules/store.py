@@ -32,6 +32,7 @@ import math
 import json
 import os
 import sqlite3
+import time
 import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
@@ -498,16 +499,31 @@ class _TursoHttpConn:
             raise ValueError("TURSO_DATABASE_URL は libsql:// か https:// で書いてください")
         self._token = token
 
-    def _http_pipeline(self, requests: list) -> list:
+    def _http_pipeline(self, requests: list, retries: int = 0) -> list:
+        """retries は**何度送っても結果が同じ書き込み**のときだけ指定する。
+
+        2026-10-02、クラウドの応答が遅く、週次更新の配当の書き込み（50行×約1,700回）の
+        うち1回が30秒で時間切れになって、更新全体（55分）が失敗した。
+        上書き型の書き込み（OR REPLACE）は同じ行を2回書いても結果が変わらないので、待って送り直す。
+        売買の記録のような INSERT は二重に入るおそれがあるので送り直さない。
+        """
         payload = json.dumps({"requests": requests}).encode("utf-8")
-        req = urllib.request.Request(
-            f"{self._base}/v2/pipeline",
-            data=payload,
-            headers={"Authorization": f"Bearer {self._token}", "Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read())["results"]
+        for attempt in range(retries + 1):
+            req = urllib.request.Request(
+                f"{self._base}/v2/pipeline",
+                data=payload,
+                headers={"Authorization": f"Bearer {self._token}",
+                         "Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=60 if retries else 30) as resp:
+                    return json.loads(resp.read())["results"]
+            except (TimeoutError, OSError):
+                if attempt >= retries:
+                    raise
+                time.sleep(5 * (attempt + 1))
+        raise RuntimeError("unreachable")
 
     @staticmethod
     def _py_to_arg(v):
@@ -580,7 +596,13 @@ class _TursoHttpConn:
                 stmt["args"] = args
             requests.append({"type": "execute", "stmt": stmt})
         requests.append({"type": "close"})
-        results = self._http_pipeline(requests)
+        # 上書き型（OR REPLACE）だけ送り直してよい
+        # （check_schema.py は INSERT で始まる文字列を SQL として照合するので、
+        #   語の頭（INS / OR / REPL）で比べている）
+        words = sql.upper().split()
+        idempotent = (len(words) >= 3 and words[0].startswith("INS")
+                      and words[1] == "OR" and words[2].startswith("REPL"))
+        results = self._http_pipeline(requests, retries=4 if idempotent else 0)
         for res in results:
             if res.get("type") == "error":
                 raise Exception(res.get("error", {}).get("message", "Turso executemany error"))

@@ -121,7 +121,8 @@ def build_alerts(config: dict) -> pd.DataFrame:
         # 「採用基準を外れた」はそれだけでは異変ではない。新規で買わない理由であって、
         # 持っている株を手放す理由ではないから（実測で160件中99件がこれだった）。
         lead = broken["理由"].splitlines()[0].lstrip("- ") if broken is not None else ""
-        if cut_fired and lead.startswith("直近の配当年度で減配した"):
+        # 累進・DOE の会社は「○○を掲げているのに、直近の配当年度で減配した」になるので含む判定
+        if cut_fired and "直近の配当年度で減配した" in lead:
             pass                       # 上の減配アラートと同じ出来事なので出さない
         elif broken is not None and broken["重さ"] == "売却を検討":
             add(ticker, "high", "dividend_broken",

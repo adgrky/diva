@@ -129,6 +129,7 @@ def turso(local_db, monkeypatch):
     fake = FakeTurso()
     monkeypatch.setenv("TURSO_DATABASE_URL", "libsql://fake.example")
     monkeypatch.setenv("TURSO_AUTH_TOKEN", "t")
-    monkeypatch.setattr(S._TursoHttpConn, "_http_pipeline", lambda self, reqs: fake.pipeline(reqs))
+    monkeypatch.setattr(S._TursoHttpConn, "_http_pipeline",
+                        lambda self, reqs, retries=0: fake.pipeline(reqs))
     S.init_db()   # クラウド側にもテーブルを作る
     return fake
