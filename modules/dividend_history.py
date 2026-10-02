@@ -39,7 +39,7 @@ _CUT_TOLERANCE = 0.995
 _FY_TOLERANCE_DAYS = 30
 
 
-def annual_dps(div: pd.DataFrame) -> pd.DataFrame:
+def annual_dps(div: pd.DataFrame, fy_month: int | None = None) -> pd.DataFrame:
     """1銘柄の配当明細 -> 年度別 DPS。
 
     【年度の切り方 — 以前は直近の権利落ち日から1年ずつ遡っていた】
@@ -71,15 +71,26 @@ def annual_dps(div: pd.DataFrame) -> pd.DataFrame:
     # 切ったとき、最後の1回が中間配当だと、その月を年度末と勘違いして年度の
     # 区切りが半年ずれる（実測: 3月期の明細を9月で切ると年度が全部ずれた）。
     # 支払月の出現回数から決めれば、どこで切っても同じ答えになる。
+    #
+    # 【決算月が分かるときは、それを使う（2026-10-02）】
+    # 年2回払う会社は中間と期末の回数が同じなので、支払月からは決算月が決まらない。
+    # 同数のときは3月を優先していたため、9月決算の会社は半年ずれた年度で合算され、
+    # 増配なのに減配と判定されていた。
+    #     東陽テクニカ（9月決算）本当は 68円 → 69円 の増配
+    #                            3月区切りだと 73円 → 69円 の「減配」
+    # 財務（fundamentals.fiscal_end）から決算月が取れる銘柄は、そちらで切る。
     counts = d["date"].dt.month.value_counts()
-    top = counts.max()
-    tied = [m for m in counts.index if counts[m] == top]
-    # 同数のときの優先順（日本の決算期末の多い順）。ここを固定しておかないと、
-    # データが1件増えるたびに年度の区切りが動いてしまう。
-    order = [3, 12, 9, 6, 2, 5, 8, 11, 1, 4, 7, 10]
-    month = min(tied, key=lambda m: order.index(m) if m in order else 99)
+    if fy_month:
+        month = int(fy_month)
+    else:
+        top = counts.max()
+        tied = [m for m in counts.index if counts[m] == top]
+        # 同数のときの優先順（日本の決算期末の多い順）。ここを固定しておかないと、
+        # データが1件増えるたびに年度の区切りが動いてしまう。
+        order = [3, 12, 9, 6, 2, 5, 8, 11, 1, 4, 7, 10]
+        month = min(tied, key=lambda m: order.index(m) if m in order else 99)
     days = d.loc[d["date"].dt.month == month, "date"].dt.day
-    day = int(min(days.median(), 28))
+    day = int(min(days.median(), 28)) if len(days) else 28
 
     def label(ts: pd.Timestamp) -> int:
         """その配当がどの年度のものか。年度末は anchor と同じ月日。"""
@@ -100,8 +111,11 @@ def annual_dps(div: pd.DataFrame) -> pd.DataFrame:
     # 中間配当だけ済んでいて期末配当がまだ、という年は回数が足りないので、
     # 残したままだと**毎年9月から3月までのあいだ、全社が減配したように見える**。
     # 同じことがデータを途中で切ったときにも起きる（検証で先を見ないために切る）。
+    # 「いつもの回数」は**直近の完結した3年**で決める。全期間の最頻値にすると、
+    # 昔は年1回だった会社（フェローテック・和田興産など）で「1回」が基準になり、
+    # 中間配当だけ済んだ今年が残って減配に見えていた。
     if len(out) >= 3:
-        usual = int(out["n_payments"].iloc[1:-1].mode().iloc[0]) \
+        usual = int(out["n_payments"].iloc[-4:-1].mode().max()) \
             if len(out) >= 4 else int(out["n_payments"].median())
         if out["n_payments"].iloc[-1] < usual:
             out = out.iloc[:-1]
@@ -156,8 +170,9 @@ def _cagr(series: pd.Series, years: int) -> float | None:
     return float((end / start) ** (1 / years) - 1)
 
 
-def build_profile(ticker: str, div: pd.DataFrame) -> DividendProfile:
-    table = annual_dps(div)
+def build_profile(ticker: str, div: pd.DataFrame,
+                  fy_month: int | None = None) -> DividendProfile:
+    table = annual_dps(div, fy_month)
     if table.empty:
         return DividendProfile(ticker=ticker)
 
@@ -231,13 +246,35 @@ def payout_months(dividends: pd.DataFrame, years: int = 3) -> pd.Series:
     return d.groupby("ticker")["date"].apply(lambda s: sorted(set(s.dt.month)))
 
 
-def build_profiles(dividends: pd.DataFrame) -> dict[str, DividendProfile]:
-    """全銘柄分をまとめて作る。dividends は ticker/date/amount の縦持ち。"""
+def fiscal_months() -> dict[str, int]:
+    """銘柄ごとの決算月（直近の決算期末の月）。財務が取れている銘柄だけ。"""
+    from modules.store import read_df
+    try:
+        f = read_df("SELECT ticker, MAX(fiscal_end) AS fe FROM fundamentals GROUP BY ticker")
+    except Exception:
+        return {}
+    out = {}
+    for t, fe in f.itertuples(index=False):
+        try:
+            out[str(t)] = int(str(fe)[5:7])
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def build_profiles(dividends: pd.DataFrame,
+                   fy_months: dict[str, int] | None = None) -> dict[str, DividendProfile]:
+    """全銘柄分をまとめて作る。dividends は ticker/date/amount の縦持ち。
+
+    fy_months（銘柄→決算月）を渡すと、配当年度を決算期で区切る。
+    渡さないと支払月から推定する（過去検証など、財務を使えない場面用）。
+    """
     out: dict[str, DividendProfile] = {}
     if dividends is None or dividends.empty:
         return out
+    fy_months = fy_months or {}
     for ticker, grp in dividends.groupby("ticker", sort=False):
-        out[str(ticker)] = build_profile(str(ticker), grp)
+        out[str(ticker)] = build_profile(str(ticker), grp, fy_months.get(str(ticker)))
     return out
 
 

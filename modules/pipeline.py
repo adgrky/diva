@@ -19,7 +19,8 @@ import pandas as pd
 
 from modules import fundamentals as fnd
 from modules import scoring, traps
-from modules.dividend_history import build_profiles, payout_months, profiles_to_frame
+from modules.dividend_history import (build_profiles, fiscal_months, payout_months,
+                                      profiles_to_frame)
 from modules.store import latest_scores, read_df, upsert_df  # noqa: F401  （後方互換のため再輸出）
 from modules.quality import trim_frame
 from modules.valuation import build_valuation_table
@@ -36,6 +37,81 @@ def _safe_div(a, b):
     return pd.Series(a).astype(float) / b.astype(float)
 
 
+# 決算期末の前後で、その期の配当とみなす幅。日本株の権利落ち日は期末の
+# 1営業日前なので、期末の前後20日で十分に収まる。
+_FY_EDGE_DAYS = 20
+
+
+def fiscal_year_dps(div: pd.DataFrame, fund: pd.DataFrame,
+                    splits: pd.DataFrame | None = None,
+                    current_shares: pd.Series | None = None) -> pd.DataFrame:
+    """純利益と**同じ決算期**に払った1株配当を、銘柄ごとに出す。
+
+    【以前のやり方と、その誤り】
+    配当性向を「直近の配当年度の DPS × 株数 ÷ 直近期の純利益」で出していた。
+    配当年度は支払月の多い月で区切るので、決算期とずれる会社があった。
+        東陽テクニカ（9月決算・3月と9月に配当）→ 3月区切りになり半年ずれる
+        和田興産・フェローテック → まだ決算の出ていない期の配当と前期の利益を割っていた
+        スミダ（12月決算）→ 半年前の配当年度と割っていた
+    ここでは決算期末（fundamentals.fiscal_end）を軸に、その1年間に権利落ちした
+    配当を合計する。分子と分母が必ず同じ期になる。
+
+    【株数と分割】
+    配当（yfinance）は今の株数に合わせて分割調整済み。決算期末の株数は、
+    yfinance がたいてい調整済みで返すが、調整していないこともある
+    （実測: 期末後に2分割した 2163・3193 は期末の株数のまま）。
+    期末後の分割比率と「今の株数 ÷ 期末の株数」が一致するときだけ株数を掛け直す。
+
+    Returns: index=ticker, 列 dps_fy / dps_fy_prev / shares_fy / fy_end
+    """
+    if div is None or div.empty or fund is None or fund.empty:
+        return pd.DataFrame(columns=["dps_fy", "dps_fy_prev", "shares_fy", "fy_end"])
+    d = div[div["amount"] > 0].copy()
+    d["date"] = pd.to_datetime(d["date"])
+    by_t = {t: g for t, g in d.groupby("ticker")}
+    sp = {}
+    if splits is not None and not splits.empty:
+        s2 = splits.copy()
+        s2["date"] = pd.to_datetime(s2["date"])
+        sp = {t: g for t, g in s2.groupby("ticker")}
+    edge = pd.Timedelta(days=_FY_EDGE_DAYS)
+
+    def _sum(g: pd.DataFrame, fe: pd.Timestamp) -> float | None:
+        start = fe - pd.DateOffset(years=1) + edge
+        v = g.loc[(g["date"] > start) & (g["date"] <= fe + edge), "amount"]
+        return float(v.sum()) if len(v) else None
+
+    rows = {}
+    f = fund.sort_values(["ticker", "fiscal_end"])
+    for t, g in f.groupby("ticker", sort=False):
+        dv = by_t.get(t)
+        if dv is None:
+            continue
+        fe = pd.Timestamp(g["fiscal_end"].iloc[-1])
+        prev = pd.Timestamp(g["fiscal_end"].iloc[-2]) if len(g) >= 2 else None
+        shares = g["shares"].iloc[-1]
+        factor = 1.0
+        if t in sp:
+            after = sp[t].loc[sp[t]["date"] > fe, "ratio"]
+            if len(after):
+                factor = float(after.prod())
+        if factor != 1.0 and current_shares is not None and pd.notna(shares) and shares:
+            cur = current_shares.get(t)
+            ratio = (cur / shares) if cur and pd.notna(cur) else None
+            # 今の株数が期末の株数のおよそ分割比率倍なら、期末の株数は未調整
+            if not (ratio and abs(ratio / factor - 1) < 0.15):
+                factor = 1.0
+        elif current_shares is None:
+            factor = 1.0
+        rows[t] = {
+            "dps_fy": _sum(dv, fe),
+            "dps_fy_prev": _sum(dv, prev) if prev is not None else None,
+            "shares_fy": float(shares) * factor if pd.notna(shares) else None,
+            "fy_end": fe.strftime("%Y-%m"),
+        }
+    return pd.DataFrame.from_dict(rows, orient="index")
+
+
 def load_base() -> pd.DataFrame:
     """ユニバース＋最新値＋配当プロフィール＋利回りパーセンタイルを結合する。"""
     uni = read_df("SELECT ticker, code, name, sector33, market FROM universe").set_index("ticker")
@@ -45,7 +121,7 @@ def load_base() -> pd.DataFrame:
     if not trimmed.empty:
         print(f"  価格データの破損区間を除外: {len(trimmed)} 銘柄")
 
-    prof = profiles_to_frame(build_profiles(div))
+    prof = profiles_to_frame(build_profiles(div, fiscal_months()))
     val = build_valuation_table(prices, div)
     months = payout_months(div)
 
@@ -112,6 +188,63 @@ def fetch_fundamentals(tickers, progress: ProgressFn | None = None,
         upsert_df("snapshots", snap, fnd.SNAPSHOT_COLS)
 
 
+def refresh_policy_flags(prof: pd.DataFrame) -> pd.DataFrame:
+    """配当方針のフラグを、今の判定ルールで作り直す。
+
+    言い回しの取りこぼしを直しても、有報を取り直すまで（年1回）反映されないのでは
+    困る。判定は**手元に保存してある有報の全文**（data/edinet_cache）から作り直す。
+    DB の dividend_policy は先頭500字しか無いので、そこから作り直すと
+    後半に書かれた「累進配当」を落としてしまう（実測: 三井物産で起きた）。
+    全文が無い銘柄は、今のフラグに足すだけで、消すことはしない。
+    """
+    import json
+    from modules.edinet import _cache_path, parse_dividend_policy, policy_from_text
+    import gzip
+    prof = prof.copy()
+    try:
+        idx = read_df("SELECT code, doc_id FROM edinet_index")
+        doc = {f"{c}.T": d for c, d in idx.itertuples(index=False)}
+    except Exception:
+        doc = {}
+    changed = []
+    for t, r in prof.iterrows():
+        old = {}
+        try:
+            old = json.loads(r.get("policy_flags") or "{}")
+        except Exception:
+            pass
+        flags = None
+        path = _cache_path(doc[t]) if t in doc else None
+        if path is not None and path.exists():
+            try:
+                raw = gzip.decompress(path.read_bytes()).decode("utf-8", "ignore")
+                _, flags, _ = parse_dividend_policy(raw)
+            except Exception:
+                flags = None
+        if flags is None:
+            text = r.get("dividend_policy")
+            if not isinstance(text, str) or not text:
+                continue
+            flags = {**old, **policy_from_text(text)[0]}
+        score = min(sum(w for k, (_, w) in _policy_weights().items() if flags.get(k)), 1.0)
+        js = json.dumps(flags, ensure_ascii=False)
+        if js != r.get("policy_flags") or score != r.get("policy_score"):
+            prof.at[t, "policy_flags"] = js
+            prof.at[t, "policy_score"] = score
+            changed.append((js, score, t))
+    if changed:
+        from modules.store import connect
+        with connect() as conn:
+            conn.executemany("UPDATE company_profile SET policy_flags=?, policy_score=? "
+                             "WHERE ticker=?", changed)
+    return prof
+
+
+def _policy_weights() -> dict:
+    from modules.edinet import _POLICY_PATTERNS
+    return _POLICY_PATTERNS
+
+
 def attach_edinet(df: pd.DataFrame) -> pd.DataFrame:
     """EDINET（有価証券報告書）の値で上書きする。
 
@@ -126,7 +259,7 @@ def attach_edinet(df: pd.DataFrame) -> pd.DataFrame:
     """
     ed = read_df("SELECT * FROM edinet_summary")
     prof = read_df("SELECT ticker, business_ja, employees, policy_score, policy_flags, "
-                   "ex_dividend_date, dividend_rate FROM company_profile")
+                   "ex_dividend_date, dividend_rate, dividend_policy FROM company_profile")
 
     out = df.copy()
     out["edinet_years"] = 0
@@ -134,8 +267,12 @@ def attach_edinet(df: pd.DataFrame) -> pd.DataFrame:
 
     if not prof.empty:
         prof = prof.set_index("ticker")
+        prof = refresh_policy_flags(prof)
         out["policy_bonus"] = out.index.map(prof["policy_score"]).astype(float)
         out["policy_bonus"] = out["policy_bonus"].fillna(0.0)
+        # 売り判定が「累進配当・DOE を掲げているか」を見る。クラウド側には
+        # company_profile が無いので、スコアの内訳に載せて届ける。
+        out["policy_flags"] = out.index.map(prof["policy_flags"])
         out["ex_dividend_date"] = out.index.map(prof["ex_dividend_date"])
         out["dividend_rate"] = out.index.map(prof["dividend_rate"])
 
@@ -147,11 +284,23 @@ def attach_edinet(df: pd.DataFrame) -> pd.DataFrame:
     counts = ed.groupby("ticker").size()
     out["edinet_years"] = out.index.map(counts).fillna(0).astype(int)
 
-    # 有報の確定値で上書き（取れているものだけ）
+    # 有報の確定値で上書き（取れているものだけ）。
+    # ただし**有報の値が連結と同じ会社のものか**を確かめてから使う。
+    # 有報の5年表で配当性向が載るのは、ほぼ「提出会社（単体）」の表だけ。
+    # 連結決算の会社の単体の配当性向は、親会社だけの利益で割った別物になる
+    # （実測: 小松製作所は単体 92.7% に対し連結 45%、シチズンは単体 72% に対し
+    # 連結 37%）。純利益が yfinance（連結）とほぼ同じなら、単体＝連結の会社か、
+    # 連結の表から取れた値なので使ってよい。
+    ed_ni = pd.Series(out.index.map(latest["net_income"]), index=out.index).astype(float) \
+        if "net_income" in latest.columns else pd.Series(np.nan, index=out.index)
+    ed_basis = pd.Series(out.index.map(latest["basis"]), index=out.index) \
+        if "basis" in latest.columns else pd.Series(None, index=out.index)
+    same_entity = (ed_basis == "連結") | (
+        (ed_ni / out["net_income"].replace(0, np.nan) - 1).abs() < 0.10)
     for col in ("payout_ratio", "roe", "equity_ratio"):
         if col in latest.columns:
-            src = out.index.map(latest[col])
-            out[col] = pd.Series(src, index=out.index).astype(float).fillna(out[col])
+            src = pd.Series(out.index.map(latest[col]), index=out.index).astype(float)
+            out[col] = src.where(same_entity).fillna(out[col])
 
     # EPS の5年成長率。yfinance では4〜5期しか無く計算できないことが多い。
     def _cagr(g: pd.DataFrame, col: str) -> float | None:
@@ -191,10 +340,26 @@ def attach_fundamentals(df: pd.DataFrame) -> pd.DataFrame:
     shares = out["shares"]
     div_total = out["dps_latest"] * shares
     out["market_cap_oku"] = out["market_cap"] / 1e8
-    out["payout_ratio"] = _safe_div(div_total, out["net_income"]).values
-    out["payout_ratio_prev"] = _safe_div(out["dps_prev"] * shares, out["net_income_prev"]).values
-    out["fcf_payout_ratio"] = _safe_div(div_total, out["free_cf"]).values
-    out["fcf_cover"] = _safe_div(out["free_cf"], div_total).values
+
+    # 配当性向は「純利益と同じ決算期の配当」で割る（fiscal_year_dps の説明を参照）。
+    # 決算期の配当が組めない銘柄だけ、従来の直近配当年度で代用する。
+    div = read_df("SELECT ticker, date, amount FROM dividends")
+    splits = read_df("SELECT ticker, date, ratio FROM splits")
+    cur_shares = _safe_div(out["market_cap"], out["last_close"]) if "last_close" in out.columns \
+        else None
+    fy = fiscal_year_dps(div, fund, splits, cur_shares)
+    out = out.join(fy, how="left")
+    fy_total = out["dps_fy"] * out["shares_fy"].fillna(shares)
+    fy_prev_total = out["dps_fy_prev"] * out["shares_fy"].fillna(shares)
+    out["payout_ratio"] = _safe_div(fy_total, out["net_income"]).fillna(
+        _safe_div(div_total, out["net_income"])).values
+    out["payout_ratio_prev"] = _safe_div(fy_prev_total, out["net_income_prev"]).fillna(
+        _safe_div(out["dps_prev"] * shares, out["net_income_prev"])).values
+    out["payout_basis"] = np.where(out["dps_fy"].notna() & out["net_income"].notna(),
+                                   out["fy_end"].fillna("") + "期 実績", "直近12か月の配当")
+    fy_div = fy_total.fillna(div_total)
+    out["fcf_payout_ratio"] = _safe_div(fy_div, out["free_cf"]).values
+    out["fcf_cover"] = _safe_div(out["free_cf"], fy_div).values
     out["net_cash_ratio"] = _safe_div(out["net_cash"], out["market_cap"]).values
     # ネットキャッシュなら負債負担ゼロ扱い
     net_debt = (-out["net_cash"]).clip(lower=0)

@@ -227,10 +227,12 @@ def parse_business(raw: str, limit: int = 600) -> str:
 # 配当方針のキーワード。日本株の「増配意思」は、実績よりも会社が何を約束したかに出る。
 # 累進配当（減らさないと約束）や DOE（純資産に対して配当を決める）を掲げた会社は、
 # 利益が一時的に落ちても配当を維持・増加させる圧力が内側から働く。
+# 「累進的な配当」「累進的に」の言い回しと、全角の「ＤＯＥ」を以前は取りこぼしていた
+# （実測: 有報1,272社のうち累進26社・DOE32社。コンコルディア・双日・しずおかFGなど）。
 _POLICY_PATTERNS = {
-    "累進配当": (r"累進(的)?配当|減配(は)?(行わ|いたしま|しま)(ない|せん)|前年度の配当金を下限",
-               0.30),
-    "DOE（純資産配当率）": (r"DOE|株主資本配当率|純資産配当率", 0.25),
+    "累進配当": (r"累進(的)?(な)?配当|累進的に|減配(は)?(行わ|いたしま|しま)(ない|せん)"
+               r"|前年度の配当金を下限", 0.30),
+    "DOE（純資産配当率）": (r"DOE|ＤＯＥ|株主資本配当率|純資産配当率", 0.25),
     "配当性向の目標": (r"配当性向[^。]{0,20}?(\d{2})\s*[%％][^。]{0,10}?(以上|目標|とし|を目指)", 0.20),
     "連続増配を明言": (r"連続(して)?増配|増配を(継続|続け)", 0.15),
     "安定配当": (r"安定(的)?(な|に)?配当", 0.05),
@@ -255,12 +257,22 @@ def parse_dividend_policy(raw: str, limit: int = 500) -> tuple[str, dict, float]
     text = html.unescape(text)
     text = _WS_RE.sub(" ", text).replace("\n", " ").strip()
 
+    flags, score = policy_from_text(text)
+    return text[:limit], flags, score
+
+
+def policy_from_text(text: str) -> tuple[dict, float]:
+    """配当政策の本文から、方針のフラグと 0〜1 のスコアを出す。
+
+    保存済みの本文から何度でも作り直せるよう、取得とは切り離してある。
+    言い回しの取りこぼしを直したとき、有報を取り直さずに全社へ反映できる。
+    """
     flags, score = {}, 0.0
     for label, (pattern, weight) in _POLICY_PATTERNS.items():
-        if re.search(pattern, text):
+        if re.search(pattern, text or ""):
             flags[label] = True
             score += weight
-    return text[:limit], flags, min(score, 1.0)
+    return flags, min(score, 1.0)
 
 
 def parse_summary(raw: str, period_end: str) -> pd.DataFrame:

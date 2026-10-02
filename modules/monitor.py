@@ -61,8 +61,8 @@ def build_alerts(config: dict) -> pd.DataFrame:
     hold = read_df("SELECT ticker, target_yield, bottom_yield FROM holdings"
                    ).groupby("ticker").first()
 
-    from modules.dividend_history import build_profiles, profiles_to_frame
-    prof = profiles_to_frame(build_profiles(div))
+    from modules.dividend_history import build_profiles, fiscal_months, profiles_to_frame
+    prof = profiles_to_frame(build_profiles(div, fiscal_months()))
 
     targets_yield = watch[["target_yield", "bottom_yield"]].combine_first(hold)
     df = uni.join([q, sc, prof, targets_yield], how="left")

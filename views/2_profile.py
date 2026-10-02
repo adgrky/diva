@@ -277,7 +277,10 @@ if not company.empty and company["dividend_policy"].iloc[0]:
 hem = raw.get("hem_ratio")
 src = "有価証券報告書" if raw.get("edinet_years") else "yfinance"
 facts = pd.DataFrame([
-    ("配当性向", pct(raw.get("payout_ratio")), src),
+    # 配当性向の出どころは、有報があっても大半は自前計算（有報の配当性向は
+    # 単体の数字なので、連結の会社には使わない）。何で割ったかをそのまま見せる。
+    ("配当性向", pct(raw.get("payout_ratio")),
+     f"{raw.get('payout_basis') or '計算値'}（1株配当×株数÷連結純利益。会社予想ではない）"),
     ("ヘム指数（利回り×10÷配当性向）",
      f"{hem:.2f}　{'✓ 基準を満たす' if hem and hem >= 1.0 else '基準に未達'}" if hem else "—", "計算値"),
     ("FCF配当カバー率", f"{raw.get('fcf_cover'):.1f} 倍" if raw.get("fcf_cover") else "—", "yfinance"),

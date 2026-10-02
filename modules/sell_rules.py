@@ -53,6 +53,32 @@ SEVERITY_ORDER = list(SEVERITY)
 SHORT = {"売却を検討": "売却", "監視を強める": "監視", "利確を検討": "利確",
          "手入れ": "手入れ", "判定待ち": "判定待ち"}
 
+# 累進配当・DOE を掲げている会社の扱い（2026-10-02 に見直し）。
+# 以前は方針を見ずに「10年で3回減配」「配当継続スコアが低く減配歴あり」を
+# 売り・買い増し停止の理由にしていた。しかし減配の多くは方針を掲げる前の話で、
+# 掲げたあとは配当を減らさない圧力が内側から働く。手元の全市場データで確かめると、
+#     2016〜23年に減配歴がある会社の、2024〜26年の減配率
+#         累進配当を掲げる   2.9%（68社）
+#         DOE を掲げる       7.0%（86社）
+#         どちらも無い      10.1%（227社）
+# 方針は「今の有報」の文言なので後知恵が混ざる（減配した会社は累進を書きにくい）。
+# それでも、過去の減配回数だけで売りを勧める根拠にはならない。
+# そこで、方針を掲げていて**直近3年に減配が無い**会社には、過去の減配回数と
+# 配当継続スコアの低さを売り理由として使わない。方針を掲げながら実際に減配したら、
+# それは約束を破ったので従来どおり 🔴 にする。
+_COMMITTED = ("累進配当", "DOE（純資産配当率）")
+
+
+def _policy(raw: dict) -> dict:
+    v = raw.get("policy_flags")
+    if isinstance(v, dict):
+        return v
+    try:
+        return json.loads(v) if v else {}
+    except Exception:
+        return {}
+
+
 # 営業CF・FCF・有利子負債の基準を当てない業種。
 # 銀行は貸出が増えると営業CFがマイナスになり、保険は責任準備金で歪む。
 _FINANCIAL = {"銀行業", "保険業", "証券、商品先物取引業", "その他金融業"}
@@ -78,8 +104,9 @@ def _dps_series(tickers: list[str]) -> dict[str, pd.Series]:
                   tuple(tickers))
     if div.empty:
         return {}
-    from modules.dividend_history import build_profiles
-    return {t: pd.Series(p.series).sort_index() for t, p in build_profiles(div).items()}
+    from modules.dividend_history import build_profiles, fiscal_months
+    return {t: pd.Series(p.series).sort_index()
+            for t, p in build_profiles(div, fiscal_months()).items()}
 
 
 def _consecutive(vals: list[float], test) -> int:
@@ -130,6 +157,12 @@ def evaluate(pos: pd.DataFrame, config: dict) -> pd.DataFrame:
         streak = int(r.get("streak") or 0)
         cuts = int(r.get("cuts_10y") or 0)
         no_cut = r.get("streak_no_cut")
+        policy = _policy(raw)
+        committed = [k for k in _COMMITTED if policy.get(k)]
+        held_3y = pd.notna(no_cut) and int(no_cut) >= 3
+        # 方針を掲げていて、直近3年は減配していない＝過去の減配は方針以前の話とみなす
+        protected = bool(committed) and held_3y
+        policy_note = "・".join(k.replace("（純資産配当率）", "") for k in committed)
         f = fund.get(t)
         ni = f["net_income"].tolist() if f is not None else []
         ocf = f["operating_cf"].tolist() if f is not None else []
@@ -137,7 +170,13 @@ def evaluate(pos: pd.DataFrame, config: dict) -> pd.DataFrame:
         found: list[tuple[str, str, str, str]] = []   # (重さ, 理由, 根拠, やること)
 
         # ── 🔴 配当そのものが壊れた ───────────────────────────────
-        if pd.notna(no_cut) and int(no_cut) == 0 and cuts >= 1:
+        if pd.notna(no_cut) and int(no_cut) == 0 and cuts >= 1 and committed:
+            found.append(("売却を検討", f"{policy_note}を掲げているのに、直近の配当年度で減配した",
+                          f"10年の減配 {cuts} 回／配当方針: {policy_note}",
+                          "方針どおりなら起きないはずの減配。会社が方針を変えたか、"
+                          "記念配当・特別配当がなくなっただけかを決算資料で確かめる。"
+                          "後者なら売る理由ではない"))
+        elif pd.notna(no_cut) and int(no_cut) == 0 and cuts >= 1:
             # 2026-09-16 の検証（延べ16,950 銘柄・年）で、この理由の中身が変わった。
             # **減配した銘柄が持ち続けると損をする、という証拠は無い。**
             # 同じ年・同じ利回り帯でそろえて比べると、5年リターンの差は +1.0pt。
@@ -155,10 +194,17 @@ def evaluate(pos: pd.DataFrame, config: dict) -> pd.DataFrame:
                           "株価は5年で戻ることが多いので急ぐ必要はないが、"
                           "同じ資金を『高利回り かつ 減配歴なし』に移すと"
                           "5年リターンの中央値が13ポイント高い。乗り換え先を決めてから動く"))
-        if cuts >= int(sell.get("cuts_10y_serious", 3)):
-            found.append(("売却を検討", f"10年で {cuts} 回も減配している",
-                          f"減配 {cuts} 回／連続増配 {streak} 年",
-                          "景気で配当を動かす会社。増配を積み上げる器ではない"))
+        if cuts >= int(sell.get("cuts_10y_serious", 3)) and not protected:
+            if held_3y:
+                # 減配はしているが直近3年は無い。過去の事実で「売却」にはしない
+                found.append(("監視を強める", f"10年で {cuts} 回減配している（直近3年は減配なし）",
+                              f"減配 {cuts} 回／減配なし継続 {int(no_cut)} 年／連続増配 {streak} 年",
+                              "景気で配当が動きやすい会社。売る理由ではないが、"
+                              "不況のときに配当が減る前提で持つ"))
+            else:
+                found.append(("売却を検討", f"10年で {cuts} 回も減配している",
+                              f"減配 {cuts} 回／連続増配 {streak} 年",
+                              "景気で配当を動かす会社。増配を積み上げる器ではない"))
         if payout is not None and payout > float(sell.get("payout_unsustainable", 1.0)) \
                 and streak < int(sell.get("payout_grace_streak", 10)):
             # 配当性向は「直近の実績」で出している。利益が一時的に吹き飛んだ年は、
@@ -171,7 +217,15 @@ def evaluate(pos: pd.DataFrame, config: dict) -> pd.DataFrame:
             base_ni = float(np.median(prior)) if prior else None
             collapsed = (base_ni is not None and ni and ni[0] is not None
                          and ni[0] < base_ni * 0.4)
-            if collapsed:
+            if collapsed and committed:
+                found.append(("監視を強める",
+                              f"配当が利益を超えている（今期の利益が落ち込んだが、{policy_note}で配当を維持）",
+                              f"配当性向 {payout:.0%}（100%超）／純利益 "
+                              f"{ni[0]/1e8:,.0f}億（前の年までは {base_ni/1e8:,.0f}億）"
+                              f"／配当方針: {policy_note}",
+                              "利益が落ちた年に配当を据え置くのは方針どおりの動き。"
+                              "**利益が戻るかどうか**だけを次の決算で見る"))
+            elif collapsed:
                 found.append(("売却を検討", "配当が利益を超えている（今期の利益が落ち込んだため）",
                               f"配当性向 {payout:.0%}（100%超）／純利益 "
                               f"{ni[0]/1e8:,.0f}億（前の年までは {base_ni/1e8:,.0f}億）"
@@ -180,6 +234,16 @@ def evaluate(pos: pd.DataFrame, config: dict) -> pd.DataFrame:
                               "会社が出す配当性向（今期予想に対する数字）とは大きく食い違う。"
                               "**利益が戻るかどうか**で判断が変わるので、これ単独では動かない。"
                               "減配が実際に起きているかを先に見る"))
+            elif committed:
+                # DOE・累進は利益ではなく純資産や前年の配当で額を決めるので、
+                # 利益が落ちた年は配当性向が100%を超えうる。それ自体は方針どおり
+                found.append(("監視を強める",
+                              f"利益を超えて配当を出している（{policy_note}で配当を決める会社）",
+                              f"配当性向 {payout:.0%}（100%超）／連続増配 {streak} 年"
+                              f"／配当方針: {policy_note}",
+                              "利益ではなく純資産や前年の配当を基準に額を決めているので、"
+                              "利益が落ちた年は100%を超えることがある。"
+                              "2年続いて利益が戻らないなら、方針の見直し（減配）を疑う"))
             else:
                 found.append(("売却を検討", "利益を超えて配当を出している",
                               f"配当性向 {payout:.0%}（100%超）／連続増配 {streak} 年",
@@ -225,15 +289,27 @@ def evaluate(pos: pd.DataFrame, config: dict) -> pd.DataFrame:
                           "利益が戻らなければ、配当性向が100%に届いて減配になる"))
 
         for tr in traps:
-            found.append(("監視を強める", str(tr), "スキャン時の減点判定",
+            tr = str(tr)
+            # 銀行・保険の営業CFは預金・貸出の増減で大きく振れるので、
+            # 「利益に営業CFが追いついていない」は金融には意味がない
+            if is_fin and "営業CF" in tr:
+                continue
+            # 利益の連続減少（減配率1.2倍前後）と利益・営業CFの乖離（1.15倍）は弱い兆候。
+            # 累進・DOE を掲げて配当を守っている会社では売り材料にしない
+            if protected and (tr.startswith("利益が連続で減少") or "営業CF" in tr):
+                continue
+            found.append(("監視を強める", tr, "スキャン時の減点判定",
                           "増配の前提が細っていないか、次の決算で確かめる"))
 
         # 配当継続スコアが著しく低く、かつ実際に減配歴がある
         hl = r.get("health")
-        if pd.notna(hl) and hl < float(sell.get("health_danger", 30)) and cuts >= 1:
+        if pd.notna(hl) and hl < float(sell.get("health_danger", 30)) and cuts >= 1 \
+                and not protected:
             found.append(("監視を強める", "配当継続スコアが著しく低く、減配歴もある",
-                          f"配当継続スコア {hl:.0f}（50が真ん中）／10年の減配 {cuts} 回",
-                          "増配余力・増配意思・原資成長がそろって弱い。買い増しの対象からは外す"))
+                          f"配当継続スコア {hl:.0f}（50が真ん中）／10年の減配 {cuts} 回"
+                          + (f"／配当方針: {policy_note}" if committed else ""),
+                          "増配余力・増配意思・原資成長がそろって弱い。"
+                          "買い増しは、利益が戻ってからでよい"))
 
         # ── 🟡 増配が止まった ────────────────────────────────────
         s = dps.get(t)

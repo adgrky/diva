@@ -29,8 +29,8 @@ def load_positions(config: dict) -> pd.DataFrame:
     ph = ",".join("?" * len(tickers))
     div = read_df(f"SELECT ticker, date, amount FROM dividends WHERE ticker IN ({ph})",
                   tuple(tickers))
-    from modules.dividend_history import build_profiles, profiles_to_frame
-    prof = profiles_to_frame(build_profiles(div))
+    from modules.dividend_history import build_profiles, fiscal_months, profiles_to_frame
+    prof = profiles_to_frame(build_profiles(div, fiscal_months()))
 
     df = h.set_index("ticker").join([q, u, sc, prof], how="left").reset_index()
     df["name"] = df["name"].fillna(df["name_jpx"])

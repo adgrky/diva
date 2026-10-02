@@ -1,6 +1,8 @@
 """Streamlit 側の共通部品。ロジックは持たない。"""
 from __future__ import annotations
 
+from datetime import datetime
+
 import pandas as pd
 import streamlit as st
 
@@ -145,6 +147,12 @@ def freshness_banner(sidebar: bool = True) -> None:
     if not a:
         return
     where0 = st.sidebar if sidebar else st
+    from modules import updater
+    local = updater.can_run_here()
+    how = ("左の **📥 データを更新** を押してください（約20分）" if local
+           else "パソコンで DIVA を開いて **📥 データを更新** を押してください（約20分）")
+    with where0:
+        update_panel()
     # 更新スクリプトを走らせてもアプリ側は最大10分キャッシュを持つ。
     # 手で入れ替えられるようにしておかないと「更新したのに数字が変わらない」になる。
     if where0.button("🔄 読み込み直す", width="stretch",
@@ -155,17 +163,64 @@ def freshness_banner(sidebar: bool = True) -> None:
     where = st.sidebar if sidebar else st
     ng = last_update_failed()
     if ng:
-        where.error(f"⚠️ **前回の自動更新が失敗しています**\n\n{ng}\n\n"
-                    "**更新.command をダブルクリック**して手で更新してください。")
+        where.error(f"⚠️ **前回の自動更新が失敗しています**\n\n{ng}\n\n{how}。")
     detail = "　／　".join(f"{k} {v:%m/%d}" for k, v in a.items() if not k.startswith("_"))
     if days >= _VERY_STALE_DAYS:
         where.error(f"⚠️ **データが {days} 日前のものです**\n\n{detail}\n\n"
-                    "この数字で売買を決めないでください。\n\n"
-                    "**更新.command をダブルクリック**してください（約10分）。")
+                    f"この数字で売買を決めないでください。\n\n{how}。")
     elif days >= _STALE_DAYS:
         where.warning(f"データは **{days} 日前**（{a['_最古']:%Y-%m-%d}）\n\n{detail}\n\n"
-                      "そろそろ更新どきです。**更新.command をダブルクリック**（約10分）。")
+                      f"そろそろ更新どきです。{how}。")
     else:
         where.caption(f"📅 データは **{a['_最古']:%Y-%m-%d}** 時点"
                       + ("（今日）" if days == 0 else f"（{days}日前）")
                       + f"\n\n{detail}")
+
+
+def update_panel() -> None:
+    """📥 データを更新。押すと裏で更新が走り、終わるまで進み具合を出す。
+
+    Finder で 更新.command を探してダブルクリックしなくて済むようにする。
+    パソコンで開いているときだけ出す（クラウドからは更新できない）。
+    """
+    from modules import updater
+    if not updater.can_run_here():
+        return
+    running = updater.is_running()
+    # 走っているあいだだけ5秒ごとに読み直す。止まっているときは何もしない
+    st.fragment(run_every=5 if running else None)(_update_body)()
+
+
+def _update_body() -> None:
+    from modules import updater
+    s = updater.status()
+    was = st.session_state.get("_upd_running", False)
+    st.session_state["_upd_running"] = s["running"]
+    if was and not s["running"]:
+        # 終わった瞬間に新しい数字へ入れ替える（「読み込み直す」を押さなくてよい）
+        st.cache_data.clear()
+        st.session_state["_upd_just_done"] = True
+        st.rerun(scope="app")
+    if s["running"]:
+        mins = ((datetime.now() - s["started"]).seconds // 60) if s["started"] else 0
+        st.info(f"⏳ **データを更新中…**（{mins}分経過・全部で約20分）\n\n"
+                "この画面を閉じても更新は続きます。終わると自動で新しい数字に入れ替わります。")
+        if s["log"]:
+            import re
+            st.caption("\n\n".join(re.sub(r"^\[[^\]]*\]\s*", "", ln) for ln in s["log"][-3:]))
+        return
+    st.session_state.pop("_upd_just_done", None)
+    recent = s["started"] and (datetime.now() - s["started"]).total_seconds() < 6 * 3600
+    if s["finished"] and recent:
+        if s["ok"]:
+            st.success(f"✅ 更新が終わりました（{s['started']:%m/%d %H:%M} 開始）")
+        else:
+            st.warning("⚠️ 前回の更新は一部失敗しました。もう一度押すと、足りないところだけ取り直します。")
+    if st.button("📥 データを更新", width="stretch", type="primary",
+                 help="株価・配当・スコアを取り直します（約20分）。会社情報・有報は古くなっているときだけ"
+                      "一緒に取り直します。裏で走るので、そのままアプリを使えます"):
+        if updater.start():
+            st.session_state["_upd_running"] = True
+            st.rerun(scope="app")
+        else:
+            st.warning("ほかの更新（土曜の自動更新など）が走っています。終わるまでお待ちください。")

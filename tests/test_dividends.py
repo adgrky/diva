@@ -68,3 +68,23 @@ def test_same_day_split_leaves_real_increase_alone():
     splits = pd.DataFrame([{"ticker": "9433.T", "date": "2025-09-29", "ratio": 2.0}])
     out, changed = fix_same_day_split_dividends(div, splits)
     assert changed.empty and out["amount"].tolist() == div["amount"].tolist()
+
+
+def test_september_fy_uses_fiscal_month_not_march():
+    """東陽テクニカ（9月決算・3月と9月に配当）: 3月で切ると増配が減配に見える。"""
+    d = _div([("2023-03-28", 22), ("2023-09-28", 32), ("2024-03-28", 25), ("2024-09-27", 43),
+              ("2025-03-28", 30), ("2025-09-29", 39), ("2026-03-30", 30)])
+    a = annual_dps(d, fy_month=9)
+    assert a["dps"].tolist() == [54, 68, 69]          # 増配が続いている
+    b = annual_dps(d)                                  # 決算月を知らないと
+    assert b["dps"].iloc[-1] < b["dps"].iloc[-2]       # 減配に見えてしまう
+
+
+def test_interim_only_year_is_dropped_even_if_old_years_paid_once():
+    """昔は年1回だった会社でも、今年の中間だけの年は減配として数えない（和田興産）。"""
+    d = _div([(f"{y}-02-26", 40) for y in range(2015, 2021)]
+             + [("2021-08-28", 30), ("2022-02-26", 30), ("2022-08-28", 30), ("2023-02-26", 32),
+                ("2023-08-28", 32), ("2024-02-26", 34), ("2024-08-28", 34), ("2025-02-26", 36),
+                ("2025-08-28", 36)])
+    a = annual_dps(d, fy_month=2)
+    assert a["n_payments"].iloc[-1] == 2 and a.index[-1] == 2025

@@ -57,7 +57,10 @@ echo ""
 # ── サーバーを起動し、応答を確認してからブラウザを開く ──
 # Streamlit 任せにすると環境によってブラウザが開かないことがあるので、
 # ここで自分で開く。
-.venv/bin/streamlit run app.py \
+# .venv/bin/streamlit は作ったときのフォルダの場所を中に書き込んでいるので、
+# フォルダの名前を変えると動かなくなる（実測: dividend-scout → diva で起動できなくなった）。
+# python -m で呼べば場所に依存しない。
+.venv/bin/python -m streamlit run app.py \
   --server.port "$PORT" \
   --server.headless true \
   --browser.gatherUsageStats false &

@@ -31,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from modules.bulk_fetch import scan                                   # noqa: E402
 from modules.config import load_config                                # noqa: E402
 from modules.fundamentals import RateLimited                          # noqa: E402
-from modules.dividend_history import build_profiles, profiles_to_frame  # noqa: E402
+from modules.dividend_history import build_profiles, fiscal_months, profiles_to_frame  # noqa: E402
 from modules.pipeline import fetch_fundamentals, load_base, prescreen, run_scoring  # noqa: E402
 from modules.store import connect, init_db, purge_tickers, read_df, upsert_df  # noqa: E402
 from modules.universe import delisted_to_purge, fetch_delisted, fetch_universe  # noqa: E402
@@ -106,7 +106,7 @@ def refresh_prices(tickers: list[str], config: dict) -> dict:
 def summarize_dividends() -> pd.DataFrame:
     """DB の配当履歴から全銘柄の配当プロフィールを作って表示用に返す。"""
     div = read_df("SELECT ticker, date, amount FROM dividends")
-    profiles = build_profiles(div)
+    profiles = build_profiles(div, fiscal_months())
     return profiles_to_frame(profiles)
 
 

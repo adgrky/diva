@@ -959,7 +959,7 @@ with tab9:
     st.markdown("##### 年間の受取配当 — 階段が上がっているか")
     stair = dividend_staircase(positions, config)
     if stair.empty:
-        st.info("配当履歴がまだありません。更新.command を実行すると貯まります。")
+        st.info("配当履歴がまだありません。画面左の「📥 データを更新」を押すと貯まります。")
     else:
         st.caption("**いまの保有数のまま過去も持っていたら**、年ごとにいくら受け取っていたか。"
                    "実際の受取額ではありません（当時の株数は残っていないため）。"
